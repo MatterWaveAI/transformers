@@ -759,6 +759,7 @@ class GRTPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = ["past_key_values"]
     _input_embed_layer = "embedding"
     _supports_sdpa = True
+    _supports_attention_backend = True
     # Position angles are `position * exp(log_freqs)`, so the frequencies keep fp32 precision in a bf16/fp16 model.
     _keep_in_fp32_modules_strict = ["pos_encoding"]
     _can_record_outputs = {

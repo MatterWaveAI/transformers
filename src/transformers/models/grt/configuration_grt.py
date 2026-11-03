@@ -65,6 +65,23 @@ class GRTConfig(PreTrainedConfig):
         `"pearlnorm"` normalizes the residual stream after every block, `"none"` does not.
     peri_ln (`bool`, *optional*, defaults to `False`):
         Whether to normalize the attention and feed-forward outputs before they enter the residual stream.
+    ffn_n_experts (`int`, *optional*, defaults to 0):
+        Number of rotation experts in the feed-forward network. `>= 2` enables Mixture-of-Rotations (`MoR`), while `0`
+        or `1` uses a single rotation chain.
+    mor_mode (`str`, *optional*, defaults to `"direct"`):
+        Expert angle parameterization when `ffn_n_experts >= 2`: `"direct"` stores per-expert angles directly in
+        `expert_expand_angles` and `expert_contract_angles`, and `"residual"` parameterizes each expert's angles as
+        `base_angles + mor_delta_scale * tanh(delta_angles)`.
+    mor_delta_scale (`float`, *optional*, defaults to 0.5):
+        Maximum angular offset in radians in `"residual"` MoR mode.
+    mor_router_mode (`str`, *optional*, defaults to `"rotational"`):
+        Router parameterization when `ffn_n_experts >= 2`: `"rotational"` uses a 100% rotational cosine phase-angle
+        router (`GRTRotationalRouter`, zero `nn.Linear` layers), and `"linear"` uses an un-biased linear router.
+    mor_split_routers (`bool`, *optional*, defaults to `False`):
+        Whether to use separate routers for the feed-forward expand and contract rotation chains.
+    mor_top_k (`int`, *optional*):
+        Number of active experts selected per token in MoR routing. `None`, `0`, or `>= ffn_n_experts` uses dense
+        softmax routing over all experts.
     tie_word_embeddings (`bool`, *optional*, defaults to `True`):
         Whether the cosine head reads the phase angles of the input embedding rather than its own table.
 
@@ -106,6 +123,12 @@ class GRTConfig(PreTrainedConfig):
     residual_gate_mode: Literal["free", "bounded", "bounded_depth", "none"] = "bounded_depth"
     residual_norm_mode: Literal["none", "pearlnorm"] = "none"
     peri_ln: bool = False
+    ffn_n_experts: int = 0
+    mor_mode: Literal["residual", "direct"] = "direct"
+    mor_delta_scale: float = 0.5
+    mor_router_mode: Literal["rotational", "linear"] = "rotational"
+    mor_split_routers: bool = False
+    mor_top_k: int | None = None
     initializer_range: float = 0.02
     use_cache: bool = True
     # The Qwen3 tokenizer's `<|endoftext|>`.
@@ -149,6 +172,12 @@ class GRTConfig(PreTrainedConfig):
                 raise ValueError(
                     f"`{name}` ({width}) must be a multiple of {block} for a chain of {n_stages} butterfly stages."
                 )
+        if self.mor_mode not in ("residual", "direct"):
+            raise ValueError(f"`mor_mode` must be 'residual' or 'direct', got {self.mor_mode!r}.")
+        if self.mor_router_mode not in ("rotational", "linear"):
+            raise ValueError(f"`mor_router_mode` must be 'rotational' or 'linear', got {self.mor_router_mode!r}.")
+        if self.mor_delta_scale <= 0:
+            raise ValueError(f"`mor_delta_scale` must be > 0, got {self.mor_delta_scale}.")
 
 
 @auto_docstring(checkpoint="matterwaveai/grt-30m-vl")

@@ -527,12 +527,70 @@ def _plain_rotate(
     return out.reshape(orig_shape)
 
 
+def _mor_rotate(
+    hidden_states: torch.Tensor,
+    expert_angles: torch.Tensor,
+    raw_expert_scales: torch.Tensor,
+    router_weights: torch.Tensor,
+    perms: torch.Tensor | None,
+    inv_perms: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply a Mixture-of-Rotations (`MoR`) chain of blended rotation + scale stages."""
+    if hasattr(torch.ops, "grt") and hasattr(torch.ops.grt, "mor_rotate"):
+        return torch.ops.grt.mor_rotate(
+            hidden_states, expert_angles, raw_expert_scales, router_weights, perms, inv_perms
+        )
+
+    scales = F.softplus(raw_expert_scales)
+    orig_shape = hidden_states.shape
+    out = hidden_states.reshape(-1, orig_shape[-1])
+    num_tokens, dim = out.shape
+    rw = router_weights.reshape(num_tokens, -1)
+    n_stages = expert_angles.shape[1]
+    n_pairs = expert_angles.shape[2]
+
+    blended_angles = torch.einsum("ne,ekp->nkp", rw.to(dtype=expert_angles.dtype), expert_angles)
+    blended_scales = torch.einsum("ne,ekd->nkd", rw.to(dtype=scales.dtype), scales)
+
+    for k in range(n_stages):
+        if perms is not None:
+            out = out[:, perms[k]]
+
+        pairs = out.view(num_tokens, n_pairs, 2)
+        x0, x1 = pairs[:, :, 0], pairs[:, :, 1]
+
+        theta = blended_angles[:, k, :].to(dtype=out.dtype)
+        cos, sin = torch.cos(theta), torch.sin(theta)
+        scale_k = blended_scales[:, k, :].to(dtype=out.dtype)
+        out = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1).view(num_tokens, dim) * scale_k
+
+        if inv_perms is not None:
+            out = out[:, inv_perms[k]]
+    return out.reshape(orig_shape)
+
+
+class GRTRotationalRouter(nn.Module):
+    """100% rotational MoR router: cosine similarity against `n_experts` planar phase-angle prototypes."""
+
+    def __init__(self, hidden_size: int, n_experts: int):
+        super().__init__()
+        self.phase_angles = nn.Parameter(torch.empty(n_experts, hidden_size // 2))
+        self.output_scale = nn.Parameter(torch.empty(()))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        normed = hidden_states / (hidden_states.norm(dim=-1, keepdim=True) + 1e-6)
+        unit_table = torch.stack([torch.cos(self.phase_angles), torch.sin(self.phase_angles)], dim=-1).flatten(-2)
+        unit_table = unit_table * (self.phase_angles.shape[-1] ** -0.5)
+        return (normed @ unit_table.T) * F.softplus(self.output_scale)
+
+
 class GRTFeedForward(nn.Module):
     """Feed-forward network built from rotation chains.
 
     The hidden state is zero-padded to `intermediate_size`, rotated, gated by `GRTRadialGELU`, rotated again and
     truncated back to `hidden_size`. The rotations mix signal into the padded dimensions, which is what makes the
-    expansion possible without a weight matrix.
+    expansion possible without a weight matrix. When `config.ffn_n_experts >= 2`, uses Mixture-of-Rotations (`MoR`)
+    routing across `ffn_n_experts` rotation chains.
     """
 
     def __init__(self, config: GRTConfig):
@@ -540,13 +598,55 @@ class GRTFeedForward(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.n_rotations = config.ffn_n_rotations
+        self.n_experts = getattr(config, "ffn_n_experts", 0)
+        self.mor_mode = getattr(config, "mor_mode", "direct")
+        self.mor_delta_scale = float(getattr(config, "mor_delta_scale", 0.5))
+        self.mor_router_mode = getattr(config, "mor_router_mode", "rotational")
+        self.mor_split_routers = bool(getattr(config, "mor_split_routers", False))
+        self.mor_top_k = getattr(config, "mor_top_k", None)
         n_pairs = self.intermediate_size // 2
         self.activation = GRTRadialGELU()
+        self._last_router_logits: list[torch.Tensor] = []
 
-        self.expand_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
-        self.expand_scales = nn.Parameter(torch.empty(self.n_rotations, self.intermediate_size))
-        self.contract_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
-        self.contract_scales = nn.Parameter(torch.empty(self.n_rotations, self.intermediate_size))
+        if self.n_experts >= 2:
+            if self.mor_router_mode == "rotational":
+                if self.mor_split_routers:
+                    self.expand_router = GRTRotationalRouter(self.hidden_size, self.n_experts)
+                    self.contract_router = GRTRotationalRouter(self.hidden_size, self.n_experts)
+                else:
+                    self.router = GRTRotationalRouter(self.hidden_size, self.n_experts)
+            else:
+                if self.mor_split_routers:
+                    self.expand_router = nn.Linear(self.hidden_size, self.n_experts, bias=False)
+                    self.contract_router = nn.Linear(self.hidden_size, self.n_experts, bias=False)
+                else:
+                    self.router_linear = nn.Linear(self.hidden_size, self.n_experts, bias=False)
+
+            if self.mor_mode == "residual":
+                self.expand_base_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+                self.expand_delta_angles = nn.Parameter(torch.empty(self.n_experts, self.n_rotations, n_pairs))
+                self.expert_expand_scales = nn.Parameter(
+                    torch.empty(self.n_experts, self.n_rotations, self.intermediate_size)
+                )
+                self.contract_base_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+                self.contract_delta_angles = nn.Parameter(torch.empty(self.n_experts, self.n_rotations, n_pairs))
+                self.expert_contract_scales = nn.Parameter(
+                    torch.empty(self.n_experts, self.n_rotations, self.intermediate_size)
+                )
+            else:
+                self.expert_expand_angles = nn.Parameter(torch.empty(self.n_experts, self.n_rotations, n_pairs))
+                self.expert_expand_scales = nn.Parameter(
+                    torch.empty(self.n_experts, self.n_rotations, self.intermediate_size)
+                )
+                self.expert_contract_angles = nn.Parameter(torch.empty(self.n_experts, self.n_rotations, n_pairs))
+                self.expert_contract_scales = nn.Parameter(
+                    torch.empty(self.n_experts, self.n_rotations, self.intermediate_size)
+                )
+        else:
+            self.expand_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+            self.expand_scales = nn.Parameter(torch.empty(self.n_rotations, self.intermediate_size))
+            self.contract_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+            self.contract_scales = nn.Parameter(torch.empty(self.n_rotations, self.intermediate_size))
 
         if self.n_rotations > 1:
             perms, inv_perms = _build_butterfly_perms(self.n_rotations, self.intermediate_size)
@@ -555,7 +655,63 @@ class GRTFeedForward(nn.Module):
         else:
             self._ffn_perms = self._ffn_inv_perms = None
 
+    def effective_expand_angles(self) -> torch.Tensor:
+        if self.mor_mode == "residual":
+            return self.expand_base_angles.unsqueeze(0) + self.mor_delta_scale * torch.tanh(self.expand_delta_angles)
+        return self.expert_expand_angles
+
+    def effective_contract_angles(self) -> torch.Tensor:
+        if self.mor_mode == "residual":
+            return (
+                self.contract_base_angles.unsqueeze(0)
+                + self.mor_delta_scale * torch.tanh(self.contract_delta_angles)
+            )
+        return self.expert_contract_angles
+
+    def _route(self, logits: torch.Tensor) -> torch.Tensor:
+        logits_f = logits.float()
+        if self.mor_top_k is None or self.mor_top_k <= 0 or self.mor_top_k >= self.n_experts:
+            return F.softmax(logits_f, dim=-1)
+        top_vals, top_idx = torch.topk(logits_f, k=self.mor_top_k, dim=-1)
+        top_weights = F.softmax(top_vals, dim=-1)
+        weights = torch.zeros_like(logits_f)
+        return weights.scatter(-1, top_idx, top_weights)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.n_experts >= 2:
+            if self.mor_split_routers:
+                expand_logits = self.expand_router(hidden_states)
+                contract_logits = self.contract_router(hidden_states)
+                self._last_router_logits = [expand_logits, contract_logits]
+                expand_weights = self._route(expand_logits)
+                contract_weights = self._route(contract_logits)
+            else:
+                router_mod = self.router if self.mor_router_mode == "rotational" else self.router_linear
+                router_logits = router_mod(hidden_states)
+                self._last_router_logits = [router_logits]
+                expand_weights = self._route(router_logits)
+                contract_weights = expand_weights
+
+            hidden_states = F.pad(hidden_states, (0, self.intermediate_size - self.hidden_size))
+            hidden_states = _mor_rotate(
+                hidden_states,
+                self.effective_expand_angles(),
+                self.expert_expand_scales,
+                expand_weights,
+                self._ffn_perms,
+                self._ffn_inv_perms,
+            )
+            hidden_states = self.activation(hidden_states)
+            hidden_states = _mor_rotate(
+                hidden_states,
+                self.effective_contract_angles(),
+                self.expert_contract_scales,
+                contract_weights,
+                self._ffn_perms,
+                self._ffn_inv_perms,
+            )
+            return hidden_states[..., : self.hidden_size]
+
         hidden_states = F.pad(hidden_states, (0, self.intermediate_size - self.hidden_size))
         hidden_states = _plain_rotate(
             hidden_states, self.expand_angles, self.expand_scales, self._ffn_perms, self._ffn_inv_perms
@@ -820,6 +976,9 @@ class GRTPreTrainedModel(PreTrainedModel):
                 init.constant_(module.log_magnitude, text_cfg.log_magnitude_init)
             else:
                 init.constant_(module.output_scale, _raw_scale_init(text_cfg.output_scale_init))
+        elif isinstance(module, GRTRotationalRouter):
+            init.normal_(module.phase_angles, mean=0.0, std=text_cfg.phase_init_scale)
+            init.constant_(module.output_scale, _raw_scale_init(2.0))
         elif isinstance(module, GRTCosineClassificationHead):
             init.zeros_(module.phase_angles)
             _init_scale_tensor(module.pair_scales, 1.0)
@@ -854,10 +1013,28 @@ class GRTPreTrainedModel(PreTrainedModel):
             _init_butterfly_buffers(module._perms_stack, module._inv_perms_stack)
         elif isinstance(module, GRTFeedForward):
             angle_scale = getattr(text_cfg, "angle_init_scale", getattr(vision_cfg, "angle_init_scale", 0.1))
-            init.normal_(module.expand_angles, mean=0.0, std=angle_scale)
-            init.normal_(module.contract_angles, mean=0.0, std=angle_scale)
-            _init_scale_tensor(module.expand_scales, 1.0)
-            _init_scale_tensor(module.contract_scales, 1.0)
+            if module.n_experts >= 2:
+                if module.mor_mode == "residual":
+                    init.normal_(module.expand_base_angles, mean=0.0, std=angle_scale)
+                    init.normal_(module.contract_base_angles, mean=0.0, std=angle_scale)
+                    init.normal_(module.expand_delta_angles, mean=0.0, std=0.01)
+                    init.normal_(module.contract_delta_angles, mean=0.0, std=0.01)
+                else:
+                    init.normal_(module.expert_expand_angles, mean=0.0, std=angle_scale)
+                    init.normal_(module.expert_contract_angles, mean=0.0, std=angle_scale)
+                _init_scale_tensor(module.expert_expand_scales, 1.0)
+                _init_scale_tensor(module.expert_contract_scales, 1.0)
+                if module.mor_router_mode == "linear":
+                    if module.mor_split_routers:
+                        init.normal_(module.expand_router.weight, mean=0.0, std=text_cfg.initializer_range)
+                        init.normal_(module.contract_router.weight, mean=0.0, std=text_cfg.initializer_range)
+                    else:
+                        init.normal_(module.router_linear.weight, mean=0.0, std=text_cfg.initializer_range)
+            else:
+                init.normal_(module.expand_angles, mean=0.0, std=angle_scale)
+                init.normal_(module.contract_angles, mean=0.0, std=angle_scale)
+                _init_scale_tensor(module.expand_scales, 1.0)
+                _init_scale_tensor(module.contract_scales, 1.0)
             _init_butterfly_buffers(module._ffn_perms, module._ffn_inv_perms)
         elif isinstance(module, GRTDecoderLayer):
             for gate in (module.res_gate_attn, module.res_gate_ffn, module.res_gate_mixer):

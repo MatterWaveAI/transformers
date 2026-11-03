@@ -15,7 +15,8 @@
 
 import math
 from collections.abc import Callable
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -28,7 +29,13 @@ from ...configuration_utils import PreTrainedConfig
 from ...generation import GenerationMixin
 from ...masking_utils import create_causal_mask
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from ...modeling_outputs import (
+    BaseModelOutputWithPast,
+    BaseModelOutputWithPooling,
+    CausalLMOutputWithPast,
+    ModelOutput,
+    SequenceClassifierOutputWithPast,
+)
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel, slice_logits_to_keep
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -159,6 +166,149 @@ class GRTConfig(PreTrainedConfig):
                 raise ValueError(
                     f"`{name}` ({width}) must be a multiple of {block} for a chain of {n_stages} butterfly stages."
                 )
+
+
+@auto_docstring(checkpoint="matterwaveai/grt-30m-vl")
+@strict
+class GRTVisionConfig(PreTrainedConfig):
+    r"""
+    image_size (`int`, *optional*, defaults to 224):
+        Default input image resolution `(image_size, image_size)`.
+    patch_size (`int`, *optional*, defaults to 14):
+        Spatial patch size extracted by the polar rotational patch stem.
+    num_channels (`int`, *optional*, defaults to 3):
+        Number of input image channels.
+    spatial_merge_size (`int`, *optional*, defaults to 2):
+        Spatial block factor (`s x s`) merged by `GRTSpatialRotationalMerger` before entering the language model.
+    patch_n_rotations (`int`, *optional*, defaults to 11):
+        Number of Givens butterfly rotation stages in the zero-`nn.Linear` polar patch stem.
+    merger_n_rotations (`int`, *optional*, defaults to 21):
+        Number of Givens butterfly rotation stages in the `2x2` spatial rotational merger.
+    ffn_n_rotations (`int`, *optional*, defaults to 21):
+        Number of rotation stages in each of the vision feed-forward expand and contract chains.
+    n_qkv_rotations (`int`, *optional*, defaults to 11):
+        Number of rotation stages in each of the vision Q/K/V/O projection chains.
+    n_mixer_rotations (`int`, *optional*, defaults to 1):
+        Number of rotation stages in the cross-head vision mixer.
+    coupling_init_scale (`float`, *optional*, defaults to 0.01):
+        Standard deviation used to initialize the coupling tensors that modulate rotation angles by content.
+    angle_init_scale (`float`, *optional*, defaults to 0.1):
+        Standard deviation used to initialize the rotation angles.
+    pos_freq_base (`float`, *optional*, defaults to 10000.0):
+        Base of the geometric frequency ladder used by the 2D rotational position encoding.
+    learnable_rope (`bool`, *optional*, defaults to `True`):
+        Whether the 2D position frequencies are learned parameters.
+    coupling_init_mode (`str`, *optional*, defaults to `"diagonal"`):
+        Coupling initialization: `"diagonal"` adds a self-coupling term on top of the random init, `"random"` does not.
+    learnable_residual_gates (`bool`, *optional*, defaults to `True`):
+        Whether each residual branch is scaled by a learned gate.
+    residual_gate_mode (`str`, *optional*, defaults to `"bounded_depth"`):
+        Gate parameterization, one of `"free"`, `"bounded"`, `"bounded_depth"` or `"none"`.
+    residual_norm_mode (`str`, *optional*, defaults to `"none"`):
+        `"pearlnorm"` normalizes the residual stream after every block, `"none"` does not.
+    peri_ln (`bool`, *optional*, defaults to `False`):
+        Whether to normalize the attention and feed-forward outputs before they enter the residual stream.
+    is_causal (`bool`, *optional*, defaults to `False`):
+        Whether vision attention blocks apply a causal mask (defaults to `False` for bidirectional vision encoding).
+    """
+
+    model_type = "grt_vision"
+
+    image_size: int = 224
+    patch_size: int = 14
+    num_channels: int = 3
+    spatial_merge_size: int = 2
+    hidden_size: int = 256
+    intermediate_size: int | None = None
+    num_hidden_layers: int = 6
+    num_attention_heads: int = 4
+    patch_n_rotations: int = 11
+    merger_n_rotations: int = 21
+    ffn_n_rotations: int = 21
+    n_qkv_rotations: int = 11
+    n_mixer_rotations: int = 1
+    attention_dropout: float | int = 0.0
+    coupling_init_scale: float = 0.01
+    angle_init_scale: float = 0.1
+    pos_freq_base: float = 10000.0
+    learnable_rope: bool = True
+    coupling_init_mode: Literal["diagonal", "random"] = "diagonal"
+    learnable_residual_gates: bool = True
+    residual_gate_mode: Literal["free", "bounded", "bounded_depth", "none"] = "bounded_depth"
+    residual_norm_mode: Literal["none", "pearlnorm"] = "none"
+    peri_ln: bool = False
+    is_causal: bool = False
+    initializer_range: float = 0.02
+
+    def __post_init__(self, **kwargs):
+        super().__post_init__(**kwargs)
+        if self.intermediate_size is None:
+            self.intermediate_size = 4 * self.hidden_size
+
+    def validate_architecture(self):
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"`hidden_size` ({self.hidden_size}) must be divisible by `num_attention_heads` "
+                f"({self.num_attention_heads})."
+            )
+        head_dim = self.hidden_size // self.num_attention_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"`head_dim` ({head_dim}) must be even.")
+        if (self.hidden_size // 2) % 2 != 0:
+            raise ValueError(
+                f"`hidden_size // 2` ({self.hidden_size // 2}) must be even for 2D axial rotary encoding."
+            )
+        if self.image_size % (self.patch_size * self.spatial_merge_size) != 0:
+            raise ValueError(
+                f"`image_size` ({self.image_size}) must be divisible by `patch_size * spatial_merge_size` "
+                f"({self.patch_size * self.spatial_merge_size})."
+            )
+
+
+@auto_docstring(checkpoint="matterwaveai/grt-30m-vl")
+@strict
+class GRTVLConfig(PreTrainedConfig):
+    r"""
+    vision_config (`dict` or `GRTVisionConfig`, *optional*):
+        Configuration for the 100% rotational vision encoder (`GRTVisionModel`).
+    text_config (`dict` or `GRTConfig`, *optional*):
+        Configuration for the rotational language backbone (`GRTModel`).
+    image_token_id (`int`, *optional*, defaults to 151655):
+        Token ID representing `<|image_pad|>` placeholders where projected visual planar-pair tokens are scattered.
+    vision_start_token_id (`int`, *optional*, defaults to 151652):
+        Token ID representing `<|vision_start|>`.
+    vision_end_token_id (`int`, *optional*, defaults to 151653):
+        Token ID representing `<|vision_end|>`.
+    """
+
+    model_type = "grt_vl"
+    keys_to_ignore_at_inference = ["past_key_values"]
+    sub_configs = {"vision_config": GRTVisionConfig, "text_config": GRTConfig}
+
+    vision_config: PreTrainedConfig | dict[str, Any] | None = None
+    text_config: PreTrainedConfig | dict[str, Any] | None = None
+    image_token_id: int = 151655
+    vision_start_token_id: int = 151652
+    vision_end_token_id: int = 151653
+    tie_word_embeddings: bool = True
+
+    def __post_init__(self, **kwargs):
+        if isinstance(self.vision_config, dict):
+            self.vision_config = GRTVisionConfig(**self.vision_config)
+        elif self.vision_config is None:
+            self.vision_config = GRTVisionConfig()
+
+        if isinstance(self.text_config, dict):
+            self.text_config = GRTConfig(**self.text_config)
+        elif self.text_config is None:
+            self.text_config = GRTConfig(vocab_size=151669, tie_word_embeddings=self.tie_word_embeddings)
+
+        super().__post_init__(**kwargs)
+
+    @property
+    def num_image_tokens(self) -> int:
+        grid = self.vision_config.image_size // (self.vision_config.patch_size * self.vision_config.spatial_merge_size)
+        return grid * grid
 
 
 def _raw_scale_init(target_scale: float) -> float:
@@ -442,7 +592,7 @@ class GRTAttention(nn.Module):
         self.n_stages = config.n_qkv_rotations
         self.attention_dropout = config.attention_dropout
         self.scaling = self.head_dim**-0.5
-        self.is_causal = True
+        self.is_causal = getattr(config, "is_causal", True)
         self.num_key_value_groups = 1
 
         n_pairs = self.head_dim // 2
@@ -580,7 +730,8 @@ class GRTMixer(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         for k in range(self.n_rotations):
-            hidden_states = hidden_states[..., self._perms_stack[k]]
+            if k > 0:
+                hidden_states = hidden_states[..., self._perms_stack[k]]
 
             flat = hidden_states.reshape(-1, self.hidden_size)
             num_tokens = flat.shape[0]
@@ -607,7 +758,8 @@ class GRTMixer(nn.Module):
             rotated = rotated * F.softplus(self.scales[k]).view(self.n_groups, 2 * self.group_size)
 
             hidden_states = rotated.view(orig_shape)
-            hidden_states = hidden_states[..., self._inv_perms_stack[k]]
+            if k > 0:
+                hidden_states = hidden_states[..., self._inv_perms_stack[k]]
         return hidden_states
 
 
@@ -833,6 +985,8 @@ class GRTPreTrainedModel(PreTrainedModel):
                 block.quantize_weights(bits)
         if hasattr(self, "lm_head") and isinstance(self.lm_head, GRTCosineHead):
             self.lm_head.quantize_weights(bits, unit_table=unit_table, shared_qweight=shared_q)
+        if hasattr(self, "score") and isinstance(self.score, GRTCosineClassificationHead):
+            self.score.quantize_weights(bits)
         return self
 
     @torch.no_grad()
@@ -844,32 +998,64 @@ class GRTPreTrainedModel(PreTrainedModel):
         """
         super()._init_weights(module)
         config = self.config
+        text_cfg = getattr(config, "text_config", None) or config
+        vision_cfg = getattr(config, "vision_config", None) or config
         if isinstance(module, (GRTEmbedding, GRTCosineHead)):
-            init.normal_(module.phase_angles, mean=0.0, std=config.phase_init_scale)
+            init.normal_(module.phase_angles, mean=0.0, std=text_cfg.phase_init_scale)
             if isinstance(module, GRTEmbedding):
-                init.constant_(module.log_magnitude, config.log_magnitude_init)
+                init.constant_(module.log_magnitude, text_cfg.log_magnitude_init)
             else:
-                init.constant_(module.output_scale, _raw_scale_init(config.output_scale_init))
+                init.constant_(module.output_scale, _raw_scale_init(text_cfg.output_scale_init))
+        elif isinstance(module, GRTCosineClassificationHead):
+            init.zeros_(module.phase_angles)
+            _init_scale_tensor(module.pair_scales, 1.0)
+            init.copy_(
+                module.late_weights,
+                torch.tensor([[0.45, 0.35, 0.25, 0.35]], device=module.late_weights.device, dtype=module.late_weights.dtype)
+                .expand_as(module.late_weights)
+                .clone(),
+            )
+            init.constant_(module.output_scale, _raw_scale_init(4.0))
+            init.zeros_(module.bias)
         elif isinstance(module, GRTPearlNorm):
             init.ones_(module.scale)
         elif isinstance(module, GRTRotaryEmbedding):
-            init.copy_(module.log_freqs, _default_log_freqs(config))
+            init.copy_(module.log_freqs, _default_log_freqs(text_cfg))
+        elif isinstance(module, GRTRotaryEmbedding2D):
+            default_freqs = module._default_freqs()
+            init.copy_(module.log_freqs_y, default_freqs)
+            init.copy_(module.log_freqs_x, default_freqs)
+        elif isinstance(module, GRTPolarPatchEmbedding):
+            init.normal_(module.angles, mean=0.0, std=module.angle_init_scale)
+            _init_scale_tensor(module.scales, 1.0)
+            _init_butterfly_buffers(module._patch_perms, module._patch_inv_perms)
+        elif isinstance(module, GRTSpatialRotationalMerger):
+            init.normal_(module.expand_angles, mean=0.0, std=module.angle_init_scale)
+            init.normal_(module.contract_angles, mean=0.0, std=module.angle_init_scale)
+            _init_scale_tensor(module.expand_scales, 1.0)
+            _init_scale_tensor(module.contract_scales, 1.0)
+            _init_butterfly_buffers(module._merger_perms, module._merger_inv_perms)
         elif isinstance(module, GRTAttention):
+            mod_cfg = getattr(module, "config", text_cfg)
             for name in ("q", "k", "v", "o"):
-                init.normal_(getattr(module, f"{name}_angles"), mean=0.0, std=config.angle_init_scale)
+                init.normal_(getattr(module, f"{name}_angles"), mean=0.0, std=mod_cfg.angle_init_scale)
                 _init_scale_tensor(getattr(module, f"{name}_scales"), 1.0)
                 _init_coupling_tensor(
-                    getattr(module, f"{name}_coupling"), config.coupling_init_scale, config.coupling_init_mode
+                    getattr(module, f"{name}_coupling"), mod_cfg.coupling_init_scale, mod_cfg.coupling_init_mode
                 )
             _init_butterfly_buffers(module._attn_perms, module._attn_inv_perms)
         elif isinstance(module, GRTMixer):
-            init.normal_(module.angles, mean=0.0, std=config.angle_init_scale)
+            angle_scale = getattr(text_cfg, "angle_init_scale", getattr(vision_cfg, "angle_init_scale", 0.1))
+            coup_scale = getattr(text_cfg, "coupling_init_scale", getattr(vision_cfg, "coupling_init_scale", 0.01))
+            coup_mode = getattr(text_cfg, "coupling_init_mode", getattr(vision_cfg, "coupling_init_mode", "diagonal"))
+            init.normal_(module.angles, mean=0.0, std=angle_scale)
             _init_scale_tensor(module.scales, 1.0)
-            _init_coupling_tensor(module.coupling, config.coupling_init_scale, config.coupling_init_mode)
+            _init_coupling_tensor(module.coupling, coup_scale, coup_mode)
             _init_butterfly_buffers(module._perms_stack, module._inv_perms_stack)
         elif isinstance(module, GRTFeedForward):
-            init.normal_(module.expand_angles, mean=0.0, std=config.angle_init_scale)
-            init.normal_(module.contract_angles, mean=0.0, std=config.angle_init_scale)
+            angle_scale = getattr(text_cfg, "angle_init_scale", getattr(vision_cfg, "angle_init_scale", 0.1))
+            init.normal_(module.expand_angles, mean=0.0, std=angle_scale)
+            init.normal_(module.contract_angles, mean=0.0, std=angle_scale)
             _init_scale_tensor(module.expand_scales, 1.0)
             _init_scale_tensor(module.contract_scales, 1.0)
             _init_butterfly_buffers(module._ffn_perms, module._ffn_inv_perms)
@@ -960,13 +1146,16 @@ class GRTModel(GRTPreTrainedModel):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        if attention_mask is not None and attention_mask.ndim == 4:
+            causal_mask = attention_mask
+        else:
+            causal_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
 
         # Position is applied once, as a rotation of the input embedding; the blocks never see position ids.
         hidden_states = self.pos_encoding(inputs_embeds, position_ids)
@@ -1052,4 +1241,699 @@ class GRTForCausalLM(GRTPreTrainedModel, GenerationMixin):
         )
 
 
-__all__ = ["GRTConfig", "GRTForCausalLM", "GRTModel", "GRTPreTrainedModel"]
+class GRTCosineClassificationHead(nn.Module):
+    """Zero-`nn.Linear` rotational sequence classification and cross-encoder reranking head.
+
+    Combines Hermitian planar-pair phase agreement (`phase_angles` and `pair_scales` over `(num_labels, hidden_size // 2)`)
+    with multi-vector token-level rotational late interaction (`late_weights`), scaled by `output_scale` + `bias`.
+    """
+
+    def __init__(self, config: GRTConfig):
+        super().__init__()
+        self.num_labels = config.num_labels
+        n_pairs = config.hidden_size // 2
+        self.phase_angles = nn.Parameter(torch.zeros(config.num_labels, n_pairs))
+        self.pair_scales = nn.Parameter(torch.full((config.num_labels, n_pairs), _raw_scale_init(1.0)))
+        self.late_weights = nn.Parameter(
+            torch.tensor([[0.45, 0.35, 0.25, 0.35]]).expand(config.num_labels, 4).clone()
+        )
+        self.output_scale = nn.Parameter(torch.tensor(_raw_scale_init(4.0)))
+        self.bias = nn.Parameter(torch.zeros(config.num_labels))
+        self.register_buffer("_unit_table_q", None, persistent=False)
+        self.register_buffer("_unit_table_scale", None, persistent=False)
+        self._quant_bits = None
+
+    def _rot_table(self) -> torch.Tensor:
+        gains = F.softplus(self.pair_scales)
+        return torch.stack(
+            [gains * torch.cos(self.phase_angles), gains * torch.sin(self.phase_angles)], dim=-1
+        ).flatten(-2)
+
+    @torch.no_grad()
+    def quantize_weights(self, bits: int = 8) -> None:
+        if self._unit_table_q is not None and self._unit_table_scale is not None and self._quant_bits is not None:
+            unit_table = _dequantize_symmetric(
+                self._unit_table_q, self._unit_table_scale, bits=self._quant_bits, dim=-1
+            )
+        else:
+            unit_table = self._rot_table()
+        uq, us = _quantize_symmetric(unit_table, bits=bits, dim=-1)
+        self.register_buffer("_unit_table_q", uq, persistent=False)
+        self.register_buffer("_unit_table_scale", us, persistent=False)
+        self._quant_bits = bits
+        self.phase_angles = nn.Parameter(
+            torch.empty(0, dtype=unit_table.dtype, device=unit_table.device), requires_grad=False
+        )
+
+    def forward(self, hidden_states: torch.Tensor, late_features: torch.Tensor | None = None) -> torch.Tensor:
+        if self._unit_table_q is not None and self._unit_table_scale is not None and self._quant_bits is not None:
+            rot_table = _dequantize_symmetric(
+                self._unit_table_q, self._unit_table_scale, bits=self._quant_bits, dim=-1
+            ).to(hidden_states.dtype)
+        else:
+            rot_table = self._rot_table().to(hidden_states.dtype)
+        raw_score = hidden_states @ rot_table.T
+        if late_features is not None:
+            raw_score = raw_score + (late_features.to(hidden_states.dtype) @ self.late_weights.to(hidden_states.dtype).T)
+        return raw_score * F.softplus(self.output_scale) + self.bias
+
+
+@auto_docstring(
+    custom_intro="""
+    The GRT rotational Transformer with a zero-`nn.Linear` Hermitian circular-coherence and rotational late-interaction
+    head on top (`GRTCosineClassificationHead`), suitable for cross-encoder reranking (`num_labels=1`) and sequence
+    classification.
+    """
+)
+class GRTForSequenceClassification(GRTPreTrainedModel):
+    def __init__(self, config: GRTConfig):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = GRTModel(config)
+        self.score = GRTCosineClassificationHead(config)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embedding
+
+    def set_input_embeddings(self, value):
+        self.model.embedding = value
+
+    @staticmethod
+    def _circular_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Phase-preserving circular mean pooling over planar `(x, y)` pairs."""
+        pairs = hidden_states.float().unflatten(-1, (-1, 2))
+        radii = pairs.norm(dim=-1, keepdim=True)
+        directions = pairs / torch.clamp(radii, min=1e-9)
+        if attention_mask is not None:
+            mask = attention_mask.to(directions.dtype).unsqueeze(-1).unsqueeze(-1)
+            denom = torch.clamp(mask.sum(dim=1), min=1e-9)
+            dir_mean = (directions * mask).sum(dim=1) / denom
+            rad_mean = (radii * mask).sum(dim=1) / denom
+        else:
+            dir_mean = directions.mean(dim=1)
+            rad_mean = radii.mean(dim=1)
+        pooled = (dir_mean * rad_mean).flatten(start_dim=1)
+        return F.normalize(pooled, p=2, dim=-1).to(hidden_states.dtype)
+
+    @staticmethod
+    def _split_pair_segments(
+        inputs_embeds: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unpack concatenated `[query, doc]` embeddings into `(q_embeds, q_mask, d_embeds, d_mask)` starting at pos 0."""
+        valid = (
+            attention_mask.bool()
+            if attention_mask is not None and attention_mask.ndim == 2
+            else torch.ones_like(token_type_ids, dtype=torch.bool)
+        )
+        mask_q = (token_type_ids == 0) & valid
+        mask_d = (token_type_ids == 1) & valid
+
+        q_lens = mask_q.long().sum(dim=1)
+        d_lens = mask_d.long().sum(dim=1)
+        max_q = max(1, int(q_lens.max().item()))
+        max_d = max(1, int(d_lens.max().item()))
+
+        q_embeds = inputs_embeds[:, :max_q]
+        q_mask = mask_q[:, :max_q].long()
+
+        d_starts = q_lens.unsqueeze(1)
+        d_offsets = torch.arange(max_d, device=inputs_embeds.device).unsqueeze(0)
+        d_idx = (d_starts + d_offsets).clamp(max=inputs_embeds.shape[1] - 1)
+        d_embeds = inputs_embeds.gather(1, d_idx.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]))
+        d_mask = (d_offsets < d_lens.unsqueeze(1)).long()
+        return q_embeds, q_mask, d_embeds, d_mask
+
+    @staticmethod
+    def _hermitian_pair_features(
+        h_q: torch.Tensor,
+        h_d: torch.Tensor,
+        q_lex: torch.Tensor,
+        d_lex: torch.Tensor,
+        q_mask: torch.Tensor,
+        d_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute Hermitian circular conjugate product `u* v` and multi-vector rotational MaxSim/MinSim features."""
+        u = GRTForSequenceClassification._circular_pool(h_q, q_mask)
+        v = GRTForSequenceClassification._circular_pool(h_d, d_mask)
+        u_pairs = u.float().unflatten(-1, (-1, 2))
+        v_pairs = v.float().unflatten(-1, (-1, 2))
+        ux, uy = u_pairs[..., 0], u_pairs[..., 1]
+        vx, vy = v_pairs[..., 0], v_pairs[..., 1]
+        hermitian = torch.stack([ux * vx + uy * vy, ux * vy - uy * vx], dim=-1).flatten(-2).to(h_q.dtype)
+
+        # Token-level rotational MaxSim & MinSim between query tokens [B, L_q, D] and doc tokens [B, L_d, D]
+        hq_norm = F.normalize(h_q.float(), p=2, dim=-1)
+        hd_norm = F.normalize(h_d.float(), p=2, dim=-1)
+        sim_mat = torch.bmm(hq_norm, hd_norm.transpose(1, 2))  # [B, L_q, L_d]
+        mq = q_mask.bool()
+        md = d_mask.bool()
+
+        # Query -> Doc MaxSim and MinSim
+        sim_q2d = sim_mat.masked_fill(~md.unsqueeze(1), -1e4)
+        max_q2d = sim_q2d.max(dim=2).values  # [B, L_q]
+        max_q2d_valid = torch.where(mq, max_q2d, torch.zeros_like(max_q2d))
+        q_len = mq.float().sum(dim=1).clamp(min=1.0)
+        q2d_mean = max_q2d_valid.sum(dim=1) / q_len
+        min_q2d = torch.where(mq, max_q2d, torch.full_like(max_q2d, 1e4)).min(dim=1).values
+        min_q2d = torch.where(min_q2d > 10.0, torch.zeros_like(min_q2d), min_q2d)
+
+        # Doc -> Query MaxSim
+        sim_d2q = sim_mat.transpose(1, 2).masked_fill(~mq.unsqueeze(1), -1e4)
+        max_d2q = sim_d2q.max(dim=2).values  # [B, L_d]
+        max_d2q_valid = torch.where(md, max_d2q, torch.zeros_like(max_d2q))
+        d_len = md.float().sum(dim=1).clamp(min=1.0)
+        d2q_mean = max_d2q_valid.sum(dim=1) / d_len
+
+        # Lexical polar circular agreement
+        u_lex = GRTForSequenceClassification._circular_pool(q_lex, q_mask)
+        v_lex = GRTForSequenceClassification._circular_pool(d_lex, d_mask)
+        lex_cos = (u_lex.float() * v_lex.float()).sum(dim=-1)
+
+        late_feats = torch.stack([q2d_mean, d2q_mean, min_q2d, lex_cos], dim=-1).to(h_q.dtype)
+        return hermitian, late_feats
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> SequenceClassifierOutputWithPast:
+        r"""
+        token_type_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Segment token indices indicating query (`0`) vs document (`1`) tokens for cross-encoder reranking.
+        """
+        if inputs_embeds is None and input_ids is not None:
+            inputs_embeds = self.model.embedding(input_ids)
+
+        has_pair_segments = (
+            token_type_ids is not None
+            and token_type_ids.ndim == 2
+            and bool((token_type_ids == 1).any().item())
+        )
+        if has_pair_segments:
+            q_embeds, q_mask, d_embeds, d_mask = self._split_pair_segments(
+                inputs_embeds, token_type_ids, attention_mask
+            )
+            out_q: BaseModelOutputWithPast = self.model(
+                input_ids=None,
+                attention_mask=q_mask,
+                inputs_embeds=q_embeds,
+                use_cache=False,
+                **kwargs,
+            )
+            out_d: BaseModelOutputWithPast = self.model(
+                input_ids=None,
+                attention_mask=d_mask,
+                inputs_embeds=d_embeds,
+                use_cache=False,
+                **kwargs,
+            )
+            outputs = out_d
+            hermitian, late_feats = self._hermitian_pair_features(
+                out_q.last_hidden_state, out_d.last_hidden_state, q_embeds, d_embeds, q_mask, d_mask
+            )
+            pooled_logits = self.score(hermitian, late_feats)
+        else:
+            outputs = self.model(
+                input_ids=None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                **kwargs,
+            )
+            pooled = self._circular_pool(outputs.last_hidden_state, attention_mask=attention_mask)
+            pooled_logits = self.score(pooled, None)
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=pooled_logits, labels=labels, pooled_logits=pooled_logits, config=self.config
+            )
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=pooled_logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class GRTPolarPatchEmbedding(nn.Module):
+    """Zero-`nn.Linear` rotational image patch stem.
+
+    Unfolds an image `[B, C, H, W]` into non-overlapping `patch_size x patch_size` patches, zero-pads each patch vector
+    to `intermediate_size`, normalizes pair radii via `GRTPearlNorm`, applies a Givens butterfly rotation cascade, and
+    slices the first `hidden_size` dimensions (`hidden_size // 2` planar `(x, y)` pairs).
+    """
+
+    def __init__(self, config: GRTVisionConfig):
+        super().__init__()
+        self.patch_size = config.patch_size
+        self.num_channels = config.num_channels
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.n_rotations = config.patch_n_rotations
+        self.angle_init_scale = config.angle_init_scale
+        self.raw_patch_dim = self.num_channels * self.patch_size * self.patch_size
+        if self.raw_patch_dim > self.intermediate_size:
+            raise ValueError(
+                f"Patch dimension {self.raw_patch_dim} exceeds vision `intermediate_size` ({self.intermediate_size})."
+            )
+
+        n_pairs = self.intermediate_size // 2
+        self.norm_in = GRTPearlNorm(self.intermediate_size)
+        self.angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+        self.scales = nn.Parameter(torch.empty(self.n_rotations, self.intermediate_size))
+        self.norm_out = GRTPearlNorm(self.hidden_size)
+
+        if self.n_rotations > 1:
+            perms, inv_perms = _build_butterfly_perms(self.n_rotations, self.intermediate_size)
+            self._patch_perms = nn.Buffer(perms)
+            self._patch_inv_perms = nn.Buffer(inv_perms)
+        else:
+            self._patch_perms = self._patch_inv_perms = None
+
+    def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+        batch_size, channels, height, width = pixel_values.shape
+        p = self.patch_size
+        if height % p != 0 or width % p != 0:
+            raise ValueError(f"Image size ({height}x{width}) must be divisible by `patch_size` ({p}).")
+        grid_h, grid_w = height // p, width // p
+
+        # [B, C, H_p, p, W_p, p] -> [B, H_p * W_p, C * p * p]
+        patches = (
+            pixel_values.view(batch_size, channels, grid_h, p, grid_w, p)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(batch_size, grid_h * grid_w, self.raw_patch_dim)
+        )
+        padded = F.pad(patches, (0, self.intermediate_size - self.raw_patch_dim))
+        normed = self.norm_in(padded)
+        rotated = _plain_rotate(normed, self.angles, self.scales, self._patch_perms, self._patch_inv_perms)
+        hidden_states = self.norm_out(rotated[..., : self.hidden_size])
+        return hidden_states, grid_h, grid_w
+
+
+class GRTRotaryEmbedding2D(nn.Module):
+    """2D axial rotational position encoding for planar-pair patch tokens."""
+
+    def __init__(self, config: GRTVisionConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.n_pairs = config.hidden_size // 2
+        self.half_pairs = self.n_pairs // 2
+        self.pos_freq_base = config.pos_freq_base
+        default_freqs = self._default_freqs()
+        if config.learnable_rope:
+            self.log_freqs_y = nn.Parameter(default_freqs.clone())
+            self.log_freqs_x = nn.Parameter(default_freqs.clone())
+        else:
+            self.register_buffer("log_freqs_y", default_freqs.clone(), persistent=False)
+            self.register_buffer("log_freqs_x", default_freqs.clone(), persistent=False)
+
+    def _default_freqs(self) -> torch.Tensor:
+        return -math.log(self.pos_freq_base) * torch.arange(0, self.half_pairs, dtype=torch.float32) / self.half_pairs
+
+    def forward(self, hidden_states: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        rows = torch.arange(grid_h, device=device, dtype=torch.float32)
+        cols = torch.arange(grid_w, device=device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(rows, cols, indexing="ij")
+        pos_y = grid_y.reshape(-1, 1)
+        pos_x = grid_x.reshape(-1, 1)
+
+        angles_y = pos_y * torch.exp(self.log_freqs_y.float())
+        angles_x = pos_x * torch.exp(self.log_freqs_x.float())
+        angles = torch.cat([angles_y, angles_x], dim=-1).unsqueeze(0)
+
+        cos = torch.cos(angles).to(dtype)
+        sin = torch.sin(angles).to(dtype)
+        pairs = hidden_states.view(*hidden_states.shape[:-1], self.n_pairs, 2)
+        x0, x1 = pairs[..., 0], pairs[..., 1]
+        rotated = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1)
+        return rotated.view(hidden_states.shape)
+
+
+class GRTSpatialRotationalMerger(nn.Module):
+    """2x2 spatial pixel-unshuffle merger and Givens butterfly rotational projector."""
+
+    def __init__(self, config: GRTVisionConfig, out_hidden_size: int | None = None):
+        super().__init__()
+        self.merge_size = config.spatial_merge_size
+        self.in_hidden_size = config.hidden_size
+        self.out_hidden_size = out_hidden_size or config.hidden_size
+        self.merged_dim = max(self.in_hidden_size * (self.merge_size**2), self.out_hidden_size)
+        self.n_rotations = config.merger_n_rotations
+        self.angle_init_scale = config.angle_init_scale
+        n_pairs = self.merged_dim // 2
+
+        self.norm_in = GRTPearlNorm(self.merged_dim)
+        self.expand_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+        self.expand_scales = nn.Parameter(torch.empty(self.n_rotations, self.merged_dim))
+        self.activation = GRTRadialGELU()
+        self.contract_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+        self.contract_scales = nn.Parameter(torch.empty(self.n_rotations, self.merged_dim))
+        self.norm_out = GRTPearlNorm(self.out_hidden_size)
+
+        if self.n_rotations > 1:
+            perms, inv_perms = _build_butterfly_perms(self.n_rotations, self.merged_dim)
+            self._merger_perms = nn.Buffer(perms)
+            self._merger_inv_perms = nn.Buffer(inv_perms)
+        else:
+            self._merger_perms = self._merger_inv_perms = None
+
+    def forward(self, hidden_states: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
+        batch_size, _, dim = hidden_states.shape
+        s = self.merge_size
+        if grid_h % s != 0 or grid_w % s != 0:
+            raise ValueError(f"Patch grid ({grid_h}x{grid_w}) must be divisible by `spatial_merge_size` ({s}).")
+        out_h, out_w = grid_h // s, grid_w // s
+
+        merged = (
+            hidden_states.view(batch_size, grid_h, grid_w, dim)
+            .view(batch_size, out_h, s, out_w, s, dim)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(batch_size, out_h * out_w, s * s * dim)
+        )
+        if merged.shape[-1] < self.merged_dim:
+            merged = F.pad(merged, (0, self.merged_dim - merged.shape[-1]))
+
+        merged = self.norm_in(merged)
+        merged = _plain_rotate(
+            merged, self.expand_angles, self.expand_scales, self._merger_perms, self._merger_inv_perms
+        )
+        merged = self.activation(merged)
+        merged = _plain_rotate(
+            merged, self.contract_angles, self.contract_scales, self._merger_perms, self._merger_inv_perms
+        )
+        return self.norm_out(merged[..., : self.out_hidden_size])
+
+
+@auto_docstring
+class GRTVisionModel(GRTPreTrainedModel):
+    config: GRTVisionConfig
+    base_model_prefix = "visual"
+    main_input_name = "pixel_values"
+    _no_split_modules = ["GRTDecoderLayer"]
+
+    def __init__(self, config: GRTVisionConfig, out_hidden_size: int | None = None):
+        r"""
+        out_hidden_size (`int`, *optional*):
+            Output width of the spatial rotational merger (defaults to `config.hidden_size`).
+        """
+        super().__init__(config)
+        self.patch_embed = GRTPolarPatchEmbedding(config)
+        self.pos_encoding = GRTRotaryEmbedding2D(config)
+        self.blocks = nn.ModuleList(
+            [GRTDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.final_norm = GRTPearlNorm(config.hidden_size)
+        self.merger = GRTSpatialRotationalMerger(config, out_hidden_size=out_hidden_size)
+        self.post_init()
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        pixel_values: torch.FloatTensor,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        hidden_states, grid_h, grid_w = self.patch_embed(pixel_values)
+        hidden_states = self.pos_encoding(hidden_states, grid_h, grid_w)
+
+        for block in self.blocks[: self.config.num_hidden_layers]:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=None,
+                past_key_values=None,
+                **kwargs,
+            )
+
+        hidden_states = self.final_norm(hidden_states)
+        pooled_tokens = self.merger(hidden_states, grid_h, grid_w)
+        return BaseModelOutputWithPooling(
+            last_hidden_state=hidden_states,
+            pooler_output=pooled_tokens,
+        )
+
+
+@auto_docstring(
+    custom_intro="""
+    Base class for GRT-VL outputs, with hidden states, attentions, and projected rotational image hidden states.
+    """
+)
+@dataclass
+class GRTVLModelOutputWithPast(BaseModelOutputWithPast):
+    r"""
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance.
+    image_hidden_states (`torch.FloatTensor`, *optional*):
+        A `torch.FloatTensor` of size `(batch_size, num_image_tokens, hidden_size)` produced by `GRTVisionModel`.
+    """
+
+    image_hidden_states: torch.FloatTensor | None = None
+
+
+@auto_docstring(
+    custom_intro="""
+    Base class for GRT-VL causal language model (or autoregressive) outputs.
+    """
+)
+@dataclass
+class GRTVLCausalLMOutputWithPast(ModelOutput):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.text_config.vocab_size)`):
+        Prediction scores of the rotational cosine language modeling head.
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance.
+    image_hidden_states (`torch.FloatTensor`, *optional*):
+        A `torch.FloatTensor` of size `(batch_size, num_image_tokens, hidden_size)` produced by `GRTVisionModel`.
+    """
+
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
+    image_hidden_states: torch.FloatTensor | None = None
+
+
+@auto_docstring
+class GRTVLModel(GRTPreTrainedModel):
+    config: GRTVLConfig
+    base_model_prefix = "model"
+
+    def __init__(self, config: GRTVLConfig):
+        super().__init__(config)
+        self.visual = GRTVisionModel(config.vision_config, out_hidden_size=config.text_config.hidden_size)
+        self.language_model = GRTModel(config.text_config)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.language_model.embedding
+
+    def set_input_embeddings(self, value):
+        self.language_model.embedding = value
+
+    @can_return_tuple
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        return self.visual(pixel_values=pixel_values, **kwargs)
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.LongTensor | None,
+        inputs_embeds: torch.FloatTensor,
+        image_features: torch.FloatTensor,
+    ) -> torch.Tensor:
+        if input_ids is None:
+            image_token_embed = self.get_input_embeddings()(
+                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_image_mask = (inputs_embeds == image_token_embed).all(-1)
+        else:
+            special_image_mask = input_ids == self.config.image_token_id
+
+        n_image_tokens = int(special_image_mask.sum().item())
+        n_image_features = image_features.shape[0] * image_features.shape[1]
+        if n_image_tokens != n_image_features:
+            raise ValueError(
+                f"Image features and `<|image_pad|>` tokens do not match: got {n_image_tokens} image tokens "
+                f"in `input_ids` vs {n_image_features} visual features ({image_features.shape})."
+            )
+        return special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> GRTVLModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        image_features = None
+        if pixel_values is not None:
+            vision_outputs = self.get_image_features(pixel_values, return_dict=True)
+            image_features = vision_outputs.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
+            special_image_mask = self.get_placeholder_mask(input_ids, inputs_embeds, image_features)
+            mask_2d = special_image_mask[..., 0]
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[mask_2d] = image_features.reshape(-1, inputs_embeds.shape[-1])
+
+        outputs = self.language_model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        return GRTVLModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=image_features,
+        )
+
+
+@auto_docstring
+class GRTVLForConditionalGeneration(GRTPreTrainedModel, GenerationMixin):
+    config: GRTVLConfig
+    _tied_weights_keys = {"lm_head.phase_angles": "model.language_model.embedding.phase_angles"}
+
+    def __init__(self, config: GRTVLConfig):
+        super().__init__(config)
+        self.model = GRTVLModel(config)
+        self.lm_head = GRTCosineHead(config.text_config)
+        self.post_init()
+        if config.tie_word_embeddings:
+            self.lm_head.phase_angles = self.model.language_model.embedding.phase_angles
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.model.set_input_embeddings(value)
+
+    def get_encoder(self, modality: str = "image"):
+        if modality == "image":
+            return self.model.visual
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    @property
+    def language_model(self):
+        return self.model.language_model
+
+    @property
+    def visual(self):
+        return self.model.visual
+
+    def get_image_features(self, pixel_values: torch.FloatTensor, **kwargs: Unpack[TransformersKwargs]):
+        return self.model.get_image_features(pixel_values, **kwargs)
+
+    @torch.no_grad()
+    def quantize_weights(self, bits: int = 8):
+        self.model.visual.quantize_weights(bits)
+        self.model.language_model.quantize_weights(bits)
+        pa = self.model.language_model.embedding.phase_angles
+        unit_table = None
+        if pa.numel() > 0:
+            unit_table = torch.stack([torch.cos(pa), torch.sin(pa)], dim=-1).flatten(-2) * (pa.shape[-1] ** -0.5)
+        shared_q = (
+            self.model.language_model.embedding._table_q
+            if getattr(self.config, "tie_word_embeddings", True)
+            else None
+        )
+        self.lm_head.quantize_weights(bits, unit_table=unit_table, shared_qweight=shared_q)
+        return self
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> GRTVLCausalLMOutputWithPast:
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+        hidden_states = slice_logits_to_keep(outputs.last_hidden_state, logits_to_keep)
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+            )
+
+        return GRTVLCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=outputs.image_hidden_states,
+        )
+
+
+__all__ = [
+    "GRTConfig",
+    "GRTForCausalLM",
+    "GRTForSequenceClassification",
+    "GRTModel",
+    "GRTPreTrainedModel",
+    "GRTVisionConfig",
+    "GRTVisionModel",
+    "GRTVLConfig",
+    "GRTVLForConditionalGeneration",
+    "GRTVLModel",
+    "GRTVLProcessor",
+]

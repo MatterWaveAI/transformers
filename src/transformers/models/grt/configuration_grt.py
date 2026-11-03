@@ -19,7 +19,7 @@
 # limitations under the License.
 
 import math
-from typing import Literal
+from typing import Any, Literal
 
 from huggingface_hub.dataclasses import strict
 
@@ -151,4 +151,147 @@ class GRTConfig(PreTrainedConfig):
                 )
 
 
-__all__ = ["GRTConfig"]
+@auto_docstring(checkpoint="matterwaveai/grt-30m-vl")
+@strict
+class GRTVisionConfig(PreTrainedConfig):
+    r"""
+    image_size (`int`, *optional*, defaults to 224):
+        Default input image resolution `(image_size, image_size)`.
+    patch_size (`int`, *optional*, defaults to 14):
+        Spatial patch size extracted by the polar rotational patch stem.
+    num_channels (`int`, *optional*, defaults to 3):
+        Number of input image channels.
+    spatial_merge_size (`int`, *optional*, defaults to 2):
+        Spatial block factor (`s x s`) merged by `GRTSpatialRotationalMerger` before entering the language model.
+    patch_n_rotations (`int`, *optional*, defaults to 11):
+        Number of Givens butterfly rotation stages in the zero-`nn.Linear` polar patch stem.
+    merger_n_rotations (`int`, *optional*, defaults to 21):
+        Number of Givens butterfly rotation stages in the `2x2` spatial rotational merger.
+    ffn_n_rotations (`int`, *optional*, defaults to 21):
+        Number of rotation stages in each of the vision feed-forward expand and contract chains.
+    n_qkv_rotations (`int`, *optional*, defaults to 11):
+        Number of rotation stages in each of the vision Q/K/V/O projection chains.
+    n_mixer_rotations (`int`, *optional*, defaults to 1):
+        Number of rotation stages in the cross-head vision mixer.
+    coupling_init_scale (`float`, *optional*, defaults to 0.01):
+        Standard deviation used to initialize the coupling tensors that modulate rotation angles by content.
+    angle_init_scale (`float`, *optional*, defaults to 0.1):
+        Standard deviation used to initialize the rotation angles.
+    pos_freq_base (`float`, *optional*, defaults to 10000.0):
+        Base of the geometric frequency ladder used by the 2D rotational position encoding.
+    learnable_rope (`bool`, *optional*, defaults to `True`):
+        Whether the 2D position frequencies are learned parameters.
+    coupling_init_mode (`str`, *optional*, defaults to `"diagonal"`):
+        Coupling initialization: `"diagonal"` adds a self-coupling term on top of the random init, `"random"` does not.
+    learnable_residual_gates (`bool`, *optional*, defaults to `True`):
+        Whether each residual branch is scaled by a learned gate.
+    residual_gate_mode (`str`, *optional*, defaults to `"bounded_depth"`):
+        Gate parameterization, one of `"free"`, `"bounded"`, `"bounded_depth"` or `"none"`.
+    residual_norm_mode (`str`, *optional*, defaults to `"none"`):
+        `"pearlnorm"` normalizes the residual stream after every block, `"none"` does not.
+    peri_ln (`bool`, *optional*, defaults to `False`):
+        Whether to normalize the attention and feed-forward outputs before they enter the residual stream.
+    is_causal (`bool`, *optional*, defaults to `False`):
+        Whether vision attention blocks apply a causal mask (defaults to `False` for bidirectional vision encoding).
+    """
+
+    model_type = "grt_vision"
+
+    image_size: int = 224
+    patch_size: int = 14
+    num_channels: int = 3
+    spatial_merge_size: int = 2
+    hidden_size: int = 256
+    intermediate_size: int | None = None
+    num_hidden_layers: int = 6
+    num_attention_heads: int = 4
+    patch_n_rotations: int = 11
+    merger_n_rotations: int = 21
+    ffn_n_rotations: int = 21
+    n_qkv_rotations: int = 11
+    n_mixer_rotations: int = 1
+    attention_dropout: float | int = 0.0
+    coupling_init_scale: float = 0.01
+    angle_init_scale: float = 0.1
+    pos_freq_base: float = 10000.0
+    learnable_rope: bool = True
+    coupling_init_mode: Literal["diagonal", "random"] = "diagonal"
+    learnable_residual_gates: bool = True
+    residual_gate_mode: Literal["free", "bounded", "bounded_depth", "none"] = "bounded_depth"
+    residual_norm_mode: Literal["none", "pearlnorm"] = "none"
+    peri_ln: bool = False
+    is_causal: bool = False
+    initializer_range: float = 0.02
+
+    def __post_init__(self, **kwargs):
+        super().__post_init__(**kwargs)
+        if self.intermediate_size is None:
+            self.intermediate_size = 4 * self.hidden_size
+
+    def validate_architecture(self):
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"`hidden_size` ({self.hidden_size}) must be divisible by `num_attention_heads` "
+                f"({self.num_attention_heads})."
+            )
+        head_dim = self.hidden_size // self.num_attention_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"`head_dim` ({head_dim}) must be even.")
+        if (self.hidden_size // 2) % 2 != 0:
+            raise ValueError(
+                f"`hidden_size // 2` ({self.hidden_size // 2}) must be even for 2D axial rotary encoding."
+            )
+        if self.image_size % (self.patch_size * self.spatial_merge_size) != 0:
+            raise ValueError(
+                f"`image_size` ({self.image_size}) must be divisible by `patch_size * spatial_merge_size` "
+                f"({self.patch_size * self.spatial_merge_size})."
+            )
+
+
+@auto_docstring(checkpoint="matterwaveai/grt-30m-vl")
+@strict
+class GRTVLConfig(PreTrainedConfig):
+    r"""
+    vision_config (`dict` or `GRTVisionConfig`, *optional*):
+        Configuration for the 100% rotational vision encoder (`GRTVisionModel`).
+    text_config (`dict` or `GRTConfig`, *optional*):
+        Configuration for the rotational language backbone (`GRTModel`).
+    image_token_id (`int`, *optional*, defaults to 151655):
+        Token ID representing `<|image_pad|>` placeholders where projected visual planar-pair tokens are scattered.
+    vision_start_token_id (`int`, *optional*, defaults to 151652):
+        Token ID representing `<|vision_start|>`.
+    vision_end_token_id (`int`, *optional*, defaults to 151653):
+        Token ID representing `<|vision_end|>`.
+    """
+
+    model_type = "grt_vl"
+    keys_to_ignore_at_inference = ["past_key_values"]
+    sub_configs = {"vision_config": GRTVisionConfig, "text_config": GRTConfig}
+
+    vision_config: PreTrainedConfig | dict[str, Any] | None = None
+    text_config: PreTrainedConfig | dict[str, Any] | None = None
+    image_token_id: int = 151655
+    vision_start_token_id: int = 151652
+    vision_end_token_id: int = 151653
+    tie_word_embeddings: bool = True
+
+    def __post_init__(self, **kwargs):
+        if isinstance(self.vision_config, dict):
+            self.vision_config = GRTVisionConfig(**self.vision_config)
+        elif self.vision_config is None:
+            self.vision_config = GRTVisionConfig()
+
+        if isinstance(self.text_config, dict):
+            self.text_config = GRTConfig(**self.text_config)
+        elif self.text_config is None:
+            self.text_config = GRTConfig(vocab_size=151669, tie_word_embeddings=self.tie_word_embeddings)
+
+        super().__post_init__(**kwargs)
+
+    @property
+    def num_image_tokens(self) -> int:
+        grid = self.vision_config.image_size // (self.vision_config.patch_size * self.vision_config.spatial_merge_size)
+        return grid * grid
+
+
+__all__ = ["GRTConfig", "GRTVisionConfig", "GRTVLConfig"]

@@ -27,7 +27,17 @@ from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
 if is_torch_available():
     import torch
 
-    from transformers import GRTForCausalLM, GRTModel
+    from transformers import (
+        GRTForCausalLM,
+        GRTForSequenceClassification,
+        GRTModel,
+        GRTVisionConfig,
+        GRTVisionModel,
+        GRTVLConfig,
+        GRTVLForConditionalGeneration,
+        GRTVLModel,
+        GRTVLProcessor,
+    )
     from transformers.models.grt.modeling_grt import GRTPearlNorm, GRTRadialGELU, _build_butterfly_perms
 
 
@@ -257,3 +267,132 @@ class GRTIntegrationTest(unittest.TestCase):
             step = model(input_ids[:, -1:], past_key_values=prefix.past_key_values).logits[:, -1]
 
         torch.testing.assert_close(step, full, rtol=1e-4, atol=1e-4)
+
+
+@require_torch
+class GRTVLModelTest(unittest.TestCase):
+    def _tiny_vl_config(self) -> "GRTVLConfig":
+        vision_cfg = GRTVisionConfig(
+            image_size=28,
+            patch_size=7,
+            spatial_merge_size=2,
+            hidden_size=32,
+            intermediate_size=160,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            patch_n_rotations=3,
+            merger_n_rotations=3,
+            ffn_n_rotations=3,
+            n_qkv_rotations=2,
+            n_mixer_rotations=1,
+        )
+        text_cfg = GRTConfig(
+            vocab_size=256,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            ffn_n_rotations=3,
+            n_qkv_rotations=2,
+            n_mixer_rotations=1,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+        )
+        return GRTVLConfig(
+            vision_config=vision_cfg,
+            text_config=text_cfg,
+            image_token_id=250,
+            vision_start_token_id=248,
+            vision_end_token_id=249,
+        )
+
+    def test_zero_linear_layers_in_vl_model(self):
+        """Both the vision tower and the language backbone must be 100% rotational (zero `nn.Linear` layers)."""
+        config = self._tiny_vl_config()
+        model = GRTVLForConditionalGeneration(config)
+        linear_modules = [name for name, mod in model.named_modules() if isinstance(mod, torch.nn.Linear)]
+        self.assertEqual(linear_modules, [])
+
+    def test_vision_model_shapes_and_bidirectional_attention(self):
+        config = self._tiny_vl_config()
+        vision = GRTVisionModel(config.vision_config, out_hidden_size=config.text_config.hidden_size).to(torch_device).eval()
+        self.assertFalse(vision.blocks[0].attention.is_causal)
+
+        pixel_values = torch.randn(2, 3, 28, 28, device=torch_device)
+        with torch.no_grad():
+            out = vision(pixel_values)
+        # 28 / 7 = 4x4 = 16 patches; 2x2 spatial merge -> 2x2 = 4 visual tokens
+        self.assertEqual(tuple(out.last_hidden_state.shape), (2, 16, 32))
+        self.assertEqual(tuple(out.pooler_output.shape), (2, 4, 32))
+
+    def test_vl_forward_cache_and_generate(self):
+        config = self._tiny_vl_config()
+        model = GRTVLForConditionalGeneration(config).to(torch_device).eval()
+        self.assertEqual(config.num_image_tokens, 4)
+
+        # Sequence: [BOS, vision_start, 4x image_pad, vision_end, tok1, tok2]
+        input_ids = torch.tensor([[1, 248, 250, 250, 250, 250, 249, 10, 11]], device=torch_device)
+        pixel_values = torch.randn(1, 3, 28, 28, device=torch_device)
+        labels = input_ids.clone()
+        labels[:, :7] = -100
+
+        with torch.no_grad():
+            out = model(input_ids=input_ids, pixel_values=pixel_values, labels=labels, use_cache=False)
+            self.assertIsNotNone(out.loss)
+            self.assertEqual(tuple(out.logits.shape), (1, 9, 256))
+            self.assertEqual(tuple(out.image_hidden_states.shape), (1, 4, 32))
+
+            # Verify KV cache step matches full forward pass
+            prefix = model(input_ids=input_ids[:, :-1], pixel_values=pixel_values, use_cache=True)
+            step = model(input_ids=input_ids[:, -1:], past_key_values=prefix.past_key_values, use_cache=True)
+            torch.testing.assert_close(step.logits[:, -1], out.logits[:, -1], rtol=1e-4, atol=1e-4)
+
+            # Verify autoregressive generation with pixel_values
+            gen = model.generate(input_ids=input_ids, pixel_values=pixel_values, max_new_tokens=3, do_sample=False)
+            self.assertEqual(tuple(gen.shape), (1, 12))
+
+    def test_vl_quantize_weights_8bit_and_4bit(self):
+        config = self._tiny_vl_config()
+        input_ids = torch.tensor([[1, 248, 250, 250, 250, 250, 249, 10, 11]], device=torch_device)
+        pixel_values = torch.randn(1, 3, 28, 28, device=torch_device)
+
+        torch.manual_seed(0)
+        ref_model = GRTVLForConditionalGeneration(config).to(torch_device).eval()
+        with torch.no_grad():
+            ref_logits = ref_model(input_ids=input_ids, pixel_values=pixel_values).logits
+
+        for bits, atol in ((8, 0.35), (4, 1.0)):
+            torch.manual_seed(0)
+            q_model = GRTVLForConditionalGeneration(config).to(torch_device).eval()
+            q_model.quantize_weights(bits=bits)
+            with torch.no_grad():
+                q_logits = q_model(input_ids=input_ids, pixel_values=pixel_values).logits
+            torch.testing.assert_close(q_logits, ref_logits, atol=atol, rtol=0.15)
+
+    def test_sequence_classification_and_reranker(self):
+        config = GRTConfig(
+            vocab_size=256,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            ffn_n_rotations=3,
+            n_qkv_rotations=2,
+            n_mixer_rotations=1,
+            num_labels=1,
+        )
+        model = GRTForSequenceClassification(config).to(torch_device).eval()
+        linear_modules = [name for name, mod in model.named_modules() if isinstance(mod, torch.nn.Linear)]
+        self.assertEqual(linear_modules, [])
+
+        input_ids = torch.tensor([[1, 10, 20, 30, 2], [1, 15, 25, 0, 0]], device=torch_device)
+        attention_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], device=torch_device)
+        labels = torch.tensor([[1.0], [0.0]], device=torch_device)
+
+        with torch.no_grad():
+            out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        self.assertEqual(tuple(out.logits.shape), (2, 1))
+        self.assertIsNotNone(out.loss)
+
+

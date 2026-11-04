@@ -55,6 +55,9 @@ class GRTConfig(PreTrainedConfig):
         Base of the geometric frequency ladder used by the rotational position encoding.
     learnable_rope (`bool`, *optional*, defaults to `True`):
         Whether the position frequencies are learned parameters.
+    rope_placement (`str`, *optional*, defaults to `"stream"`):
+        Where 2D rotational position encoding is applied: `"stream"` rotates the full hidden stream once before Block 0,
+        while `"qk"` rotates per-head queries and keys after each block's Q/K rotation cascade for KV-cache shifting.
     coupling_init_mode (`str`, *optional*, defaults to `"diagonal"`):
         Coupling initialization: `"diagonal"` adds a self-coupling term on top of the random init, `"random"` does not.
     learnable_residual_gates (`bool`, *optional*, defaults to `True`):
@@ -118,6 +121,7 @@ class GRTConfig(PreTrainedConfig):
     log_magnitude_init: float = 0.0
     pos_freq_base: float = 10000.0
     learnable_rope: bool = True
+    rope_placement: Literal["stream", "qk"] = "stream"
     coupling_init_mode: Literal["diagonal", "random"] = "diagonal"
     learnable_residual_gates: bool = True
     residual_gate_mode: Literal["free", "bounded", "bounded_depth", "none"] = "bounded_depth"
@@ -178,6 +182,8 @@ class GRTConfig(PreTrainedConfig):
             raise ValueError(f"`mor_router_mode` must be 'rotational' or 'linear', got {self.mor_router_mode!r}.")
         if self.mor_delta_scale <= 0:
             raise ValueError(f"`mor_delta_scale` must be > 0, got {self.mor_delta_scale}.")
+        if self.rope_placement not in ("stream", "qk"):
+            raise ValueError(f"`rope_placement` must be 'stream' or 'qk', got {self.rope_placement!r}.")
 
 
 @auto_docstring(checkpoint="matterwaveai/grt-30m-vl")

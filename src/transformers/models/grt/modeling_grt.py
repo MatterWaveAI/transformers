@@ -158,15 +158,21 @@ class GRTEmbedding(nn.Module):
 
 
 def _default_log_freqs(config: GRTConfig) -> torch.Tensor:
-    n_pairs = config.hidden_size // 2
+    rope_dim = (
+        config.hidden_size // config.num_attention_heads
+        if getattr(config, "rope_placement", "stream") == "qk"
+        else config.hidden_size
+    )
+    n_pairs = rope_dim // 2
     return -torch.arange(0, n_pairs, dtype=torch.float32) / n_pairs * math.log(config.pos_freq_base)
 
 
 class GRTRotaryEmbedding(nn.Module):
     """Rotational position encoding.
 
-    Rotates each dimension pair of the input embedding by `position * freq_i` once, before the first block, with a
-    geometric ladder of (optionally learned) frequencies. Nothing is added to the hidden state.
+    Rotates each dimension pair by `position * freq_i` with a geometric ladder of (optionally learned) frequencies:
+    either once on the input embedding stream before the first block (`rope_placement="stream"`), or per-head on Q
+    and K after each block's Q/K rotation chains (`rope_placement="qk"`).
     """
 
     def __init__(self, config: GRTConfig):
@@ -181,6 +187,8 @@ class GRTRotaryEmbedding(nn.Module):
         # The angle grows with the position, and bf16 cannot even represent positions past 256 exactly, so the
         # rotation runs in fp32 whatever the activation dtype.
         angles = position_ids.float().unsqueeze(-1) * torch.exp(self.log_freqs.float())
+        if hidden_states.ndim == 4 and angles.ndim == 3:
+            angles = angles.unsqueeze(1)
         cos, sin = torch.cos(angles), torch.sin(angles)
         pairs = hidden_states.float().unflatten(-1, (-1, 2))
         x0, x1 = pairs[..., 0], pairs[..., 1]
@@ -403,6 +411,12 @@ class GRTAttention(nn.Module):
         query_states = query_states.view(hidden_shape).transpose(1, 2)
         key_states = key_states.view(hidden_shape).transpose(1, 2)
         value_states = value_states.view(hidden_shape).transpose(1, 2)
+
+        qk_rope = kwargs.get("qk_rope")
+        if qk_rope is not None:
+            pos_encoding, position_ids = qk_rope
+            query_states = pos_encoding(query_states, position_ids)
+            key_states = pos_encoding(key_states, position_ids)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
@@ -959,6 +973,18 @@ class GRTPreTrainedModel(PreTrainedModel):
             self.score.quantize_weights(bits)
         return self
 
+    def configure_optimizers(
+        self,
+        lr: float = 1e-3,
+        weight_decay: float = 0.01,
+        hessian_mode: bool = True,
+        **kwargs,
+    ):
+        """Construct a `HessianPairAdam` (`Sophia-Torus`, default) or `PairAdam` optimizer for this GRT model."""
+        from .optimization_grt import build_grt_optimizer
+
+        return build_grt_optimizer(self, lr=lr, weight_decay=weight_decay, hessian_mode=hessian_mode, **kwargs)
+
     @torch.no_grad()
     def _init_weights(self, module):
         """Angular initialization.
@@ -1106,8 +1132,12 @@ class GRTModel(GRTPreTrainedModel):
                 position_ids=position_ids,
             )
 
-        # Position is applied once, as a rotation of the input embedding; the blocks never see position ids.
-        hidden_states = self.pos_encoding(inputs_embeds, position_ids)
+        if getattr(self.config, "rope_placement", "stream") == "qk":
+            hidden_states = inputs_embeds
+            kwargs = {**kwargs, "qk_rope": (self.pos_encoding, position_ids)}
+        else:
+            # Position is applied once, as a rotation of the input embedding; the blocks never see position ids.
+            hidden_states = self.pos_encoding(inputs_embeds, position_ids)
 
         for block in self.blocks[: self.config.num_hidden_layers]:
             hidden_states = block(

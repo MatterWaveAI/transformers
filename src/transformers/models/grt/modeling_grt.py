@@ -43,7 +43,7 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
-from .configuration_grt import GRTConfig, GRTVisionConfig, GRTVLConfig
+from .configuration_grt import GRTAudioConfig, GRTConfig, GRTOmniConfig, GRTTTSConfig, GRTVisionConfig, GRTVLConfig
 
 
 class GRTPearlNorm(nn.Module):
@@ -177,11 +177,16 @@ class GRTRotaryEmbedding(nn.Module):
 
     def __init__(self, config: GRTConfig):
         super().__init__()
+        self.pos_freq_base = config.pos_freq_base
         log_freqs = _default_log_freqs(config)
+        self.n_pairs = log_freqs.numel()
         if config.learnable_rope:
             self.log_freqs = nn.Parameter(log_freqs)
         else:
             self.log_freqs = nn.Buffer(log_freqs, persistent=False)
+
+    def _default_freqs(self) -> torch.Tensor:
+        return -torch.arange(0, self.n_pairs, dtype=torch.float32) / self.n_pairs * math.log(self.pos_freq_base)
 
     def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         # The angle grows with the position, and bf16 cannot even represent positions past 256 exactly, so the
@@ -1019,7 +1024,7 @@ class GRTPreTrainedModel(PreTrainedModel):
         elif isinstance(module, GRTPearlNorm):
             init.ones_(module.scale)
         elif isinstance(module, GRTRotaryEmbedding):
-            init.copy_(module.log_freqs, _default_log_freqs(text_cfg))
+            init.copy_(module.log_freqs, module._default_freqs())
         elif isinstance(module, GRTAttention):
             mod_cfg = getattr(module, "config", None) or text_cfg
             for name in ("q", "k", "v", "o"):
@@ -1070,15 +1075,36 @@ class GRTPreTrainedModel(PreTrainedModel):
             init.normal_(module.angles, mean=0.0, std=module.angle_init_scale)
             _init_scale_tensor(module.scales, 1.0)
             _init_butterfly_buffers(module._patch_perms, module._patch_inv_perms)
+        elif isinstance(module, GRTPolarAudioStem):
+            init.normal_(module.angles, mean=0.0, std=module.angle_init_scale)
+            _init_scale_tensor(module.scales, 1.0)
+            _init_butterfly_buffers(module._stem_perms, module._stem_inv_perms)
+            if hasattr(module, "window") and module.window is not None:
+                init.copy_(
+                    module.window,
+                    torch.hann_window(module.win_length, device=module.window.device, dtype=module.window.dtype),
+                )
         elif isinstance(module, GRTRotaryEmbedding2D):
             init.copy_(module.log_freqs_y, module._default_freqs())
             init.copy_(module.log_freqs_x, module._default_freqs())
-        elif isinstance(module, GRTSpatialRotationalMerger):
+        elif isinstance(module, (GRTSpatialRotationalMerger, GRTTemporalRotationalMerger)):
             init.normal_(module.expand_angles, mean=0.0, std=module.angle_init_scale)
             init.normal_(module.contract_angles, mean=0.0, std=module.angle_init_scale)
             _init_scale_tensor(module.expand_scales, 1.0)
             _init_scale_tensor(module.contract_scales, 1.0)
             _init_butterfly_buffers(module._merger_perms, module._merger_inv_perms)
+        elif isinstance(module, GRTPolarVocoderHead):
+            init.normal_(module.expand_angles, mean=0.0, std=module.angle_init_scale)
+            init.normal_(module.contract_angles, mean=0.0, std=module.angle_init_scale)
+            _init_scale_tensor(module.expand_scales, 1.0)
+            _init_scale_tensor(module.contract_scales, 1.0)
+            init.constant_(module.output_scale, _raw_scale_init(1.0))
+            _init_butterfly_buffers(module._voc_perms, module._voc_inv_perms)
+            if hasattr(module, "window") and module.window is not None:
+                init.copy_(
+                    module.window,
+                    torch.hann_window(module.win_length, device=module.window.device, dtype=module.window.dtype),
+                )
 
 
 @auto_docstring
@@ -1912,11 +1938,770 @@ class GRTVLForConditionalGeneration(GRTPreTrainedModel, GenerationMixin):
         )
 
 
+class GRTPolarAudioStem(nn.Module):
+    """Zero-`nn.Linear`, zero-`nn.Conv1d` polar STFT rotational audio stem.
+
+    Converts a raw 1D waveform `[B, T_samples]` via STFT into polar planar pairs
+    `r = log1p(|X|)` with `(r * cos(phi), r * sin(phi))` of width `2 * (n_fft // 2 + 1)`
+    (or accepts pre-framed polar features `[B, T_frames, D_in]` directly), pads to
+    `intermediate_size`, normalizes pair radii via `GRTPearlNorm`, applies a Givens
+    butterfly rotation cascade, and slices the first `hidden_size` dimensions.
+    """
+
+    def __init__(self, config: GRTAudioConfig):
+        super().__init__()
+        self.n_fft = config.n_fft
+        self.hop_length = config.hop_length
+        self.win_length = config.win_length
+        self.max_audio_frames = config.max_audio_frames
+        self.n_freq_bins = config.n_fft // 2 + 1
+        self.spec_dim = 2 * self.n_freq_bins
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.n_rotations = config.stem_n_rotations
+        self.angle_init_scale = config.angle_init_scale
+        if self.spec_dim > self.intermediate_size:
+            raise ValueError(
+                f"Polar STFT dimension {self.spec_dim} exceeds audio `intermediate_size` ({self.intermediate_size})."
+            )
+
+        n_pairs = self.intermediate_size // 2
+        self.norm_in = GRTPearlNorm(self.intermediate_size)
+        self.angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+        self.scales = nn.Parameter(torch.empty(self.n_rotations, self.intermediate_size))
+        self.norm_out = GRTPearlNorm(self.hidden_size)
+        self.register_buffer("window", torch.hann_window(self.win_length), persistent=False)
+
+        if self.n_rotations > 1:
+            perms, inv_perms = _build_butterfly_perms(self.n_rotations, self.intermediate_size)
+            self._stem_perms = nn.Buffer(perms)
+            self._stem_inv_perms = nn.Buffer(inv_perms)
+        else:
+            self._stem_perms = self._stem_inv_perms = None
+
+    def waveform_to_polar_stft(self, audio_values: torch.Tensor) -> torch.Tensor:
+        window = self.window.to(device=audio_values.device, dtype=torch.float32)
+        if window.numel() != self.win_length:
+            window = torch.hann_window(self.win_length, device=audio_values.device, dtype=torch.float32)
+        stft = torch.stft(
+            audio_values.float(),
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        if stft.shape[-1] > self.max_audio_frames:
+            stft = stft[..., : self.max_audio_frames]
+        elif stft.shape[-1] < self.max_audio_frames:
+            stft = F.pad(stft, (0, self.max_audio_frames - stft.shape[-1]))
+        stft = stft.transpose(1, 2)  # [B, T, F]
+        mag = stft.abs()
+        phase = stft.angle()
+        r = torch.log1p(mag)
+        polar_pairs = torch.stack([r * torch.cos(phase), r * torch.sin(phase)], dim=-1).flatten(-2)
+        return polar_pairs.to(dtype=audio_values.dtype)
+
+    def forward(self, audio_values: torch.Tensor) -> torch.Tensor:
+        if audio_values.ndim == 2:
+            polar_frames = self.waveform_to_polar_stft(audio_values)
+        elif audio_values.ndim == 3:
+            polar_frames = audio_values
+        else:
+            raise ValueError(
+                f"Expected `audio_values` to be 2D `[B, T_samples]` or 3D `[B, T_frames, D]`, got {tuple(audio_values.shape)}."
+            )
+
+        if polar_frames.shape[-1] < self.intermediate_size:
+            padded = F.pad(polar_frames, (0, self.intermediate_size - polar_frames.shape[-1]))
+        else:
+            padded = polar_frames[..., : self.intermediate_size]
+        normed = self.norm_in(padded)
+        rotated = _plain_rotate(normed, self.angles, self.scales, self._stem_perms, self._stem_inv_perms)
+        return self.norm_out(rotated[..., : self.hidden_size])
+
+
+class GRTTemporalRotationalMerger(nn.Module):
+    """Zero-`nn.Linear`, zero-`nn.Conv1d` temporal frame folding and Givens butterfly rotational projector."""
+
+    def __init__(self, config: GRTAudioConfig, out_hidden_size: int | None = None):
+        super().__init__()
+        self.merge_size = config.temporal_merge_size
+        self.in_hidden_size = config.hidden_size
+        self.out_hidden_size = out_hidden_size or config.hidden_size
+        self.merged_dim = max(self.in_hidden_size * self.merge_size, self.out_hidden_size)
+        self.n_rotations = config.merger_n_rotations
+        self.angle_init_scale = config.angle_init_scale
+        n_pairs = self.merged_dim // 2
+
+        self.norm_in = GRTPearlNorm(self.merged_dim)
+        self.expand_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+        self.expand_scales = nn.Parameter(torch.empty(self.n_rotations, self.merged_dim))
+        self.activation = GRTRadialGELU()
+        self.contract_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+        self.contract_scales = nn.Parameter(torch.empty(self.n_rotations, self.merged_dim))
+        self.norm_out = GRTPearlNorm(self.out_hidden_size)
+
+        if self.n_rotations > 1:
+            perms, inv_perms = _build_butterfly_perms(self.n_rotations, self.merged_dim)
+            self._merger_perms = nn.Buffer(perms)
+            self._merger_inv_perms = nn.Buffer(inv_perms)
+        else:
+            self._merger_perms = self._merger_inv_perms = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, dim = hidden_states.shape
+        s = self.merge_size
+        if seq_len % s != 0:
+            raise ValueError(f"Audio frame count ({seq_len}) must be divisible by `temporal_merge_size` ({s}).")
+        merged = hidden_states.reshape(batch_size, seq_len // s, s * dim)
+        if merged.shape[-1] < self.merged_dim:
+            merged = F.pad(merged, (0, self.merged_dim - merged.shape[-1]))
+
+        merged = self.norm_in(merged)
+        merged = _plain_rotate(
+            merged, self.expand_angles, self.expand_scales, self._merger_perms, self._merger_inv_perms
+        )
+        merged = self.activation(merged)
+        merged = _plain_rotate(
+            merged, self.contract_angles, self.contract_scales, self._merger_perms, self._merger_inv_perms
+        )
+        return self.norm_out(merged[..., : self.out_hidden_size])
+
+
+@auto_docstring
+class GRTAudioModel(GRTPreTrainedModel):
+    config: GRTAudioConfig
+    base_model_prefix = "audio_tower"
+    main_input_name = "audio_values"
+    _no_split_modules = ["GRTDecoderLayer"]
+
+    def __init__(self, config: GRTAudioConfig, out_hidden_size: int | None = None):
+        r"""
+        out_hidden_size (`int`, *optional*):
+            Output width of the temporal rotational merger (defaults to `config.hidden_size`).
+        """
+        super().__init__(config)
+        self.stem = GRTPolarAudioStem(config)
+        self.pos_encoding = GRTRotaryEmbedding(config)
+        self.blocks = nn.ModuleList(
+            [GRTDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.final_norm = GRTPearlNorm(config.hidden_size)
+        self.merger = GRTTemporalRotationalMerger(config, out_hidden_size=out_hidden_size)
+        self.post_init()
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        audio_values: torch.FloatTensor,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        r"""
+        audio_values (`torch.FloatTensor` of shape `(batch_size, num_samples)` or `(batch_size, num_frames, spec_dim)`):
+            Raw 1D audio waveform or pre-computed polar STFT frame features.
+        """
+        hidden_states = self.stem(audio_values)
+        position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+        hidden_states = self.pos_encoding(hidden_states, position_ids)
+
+        for block in self.blocks[: self.config.num_hidden_layers]:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=None,
+                past_key_values=None,
+                **kwargs,
+            )
+
+        hidden_states = self.final_norm(hidden_states)
+        pooled_tokens = self.merger(hidden_states)
+        return BaseModelOutputWithPooling(
+            last_hidden_state=hidden_states,
+            pooler_output=pooled_tokens,
+        )
+
+
+class GRTPolarVocoderHead(nn.Module):
+    """Zero-`nn.Linear`, zero-`nn.Conv1d` rotational harmonic speech vocoder head.
+
+    Expands each language token hidden state `[B, L, D]` via a Givens butterfly rotation cascade
+    into `frames_per_token` polar STFT frames `[B, L * frames_per_token, 2 * n_freq_bins]` and
+    reconstructs the time-domain speech waveform via exact inverse STFT (`torch.istft`).
+    """
+
+    def __init__(self, config: GRTAudioConfig, in_hidden_size: int | None = None):
+        super().__init__()
+        self.in_hidden_size = in_hidden_size or config.hidden_size
+        self.n_fft = config.n_fft
+        self.hop_length = config.hop_length
+        self.win_length = config.win_length
+        self.n_freq_bins = config.n_fft // 2 + 1
+        self.spec_dim = 2 * self.n_freq_bins
+        self.frames_per_token = config.frames_per_token
+        self.expanded_dim = self.frames_per_token * self.spec_dim
+        self.n_rotations = config.vocoder_n_rotations
+        self.angle_init_scale = config.angle_init_scale
+        n_pairs = self.expanded_dim // 2
+
+        self.norm_in = GRTPearlNorm(self.expanded_dim)
+        self.expand_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+        self.expand_scales = nn.Parameter(torch.empty(self.n_rotations, self.expanded_dim))
+        self.activation = GRTRadialGELU()
+        self.contract_angles = nn.Parameter(torch.empty(self.n_rotations, n_pairs))
+        self.contract_scales = nn.Parameter(torch.empty(self.n_rotations, self.expanded_dim))
+        self.norm_out = GRTPearlNorm(self.spec_dim)
+        self.output_scale = nn.Parameter(torch.empty(()))
+        self.register_buffer("window", torch.hann_window(self.win_length), persistent=False)
+
+        if self.n_rotations > 1:
+            perms, inv_perms = _build_butterfly_perms(self.n_rotations, self.expanded_dim)
+            self._voc_perms = nn.Buffer(perms)
+            self._voc_inv_perms = nn.Buffer(inv_perms)
+        else:
+            self._voc_perms = self._voc_inv_perms = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        return_waveform: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        batch_size, seq_len, dim = hidden_states.shape
+        if dim < self.expanded_dim:
+            reps = (self.expanded_dim + dim - 1) // dim
+            padded = hidden_states.repeat(1, 1, reps)[..., : self.expanded_dim]
+        else:
+            padded = hidden_states[..., : self.expanded_dim]
+
+        normed = self.norm_in(padded)
+        rotated = _plain_rotate(normed, self.expand_angles, self.expand_scales, self._voc_perms, self._voc_inv_perms)
+        rotated = self.activation(rotated)
+        rotated = _plain_rotate(
+            rotated, self.contract_angles, self.contract_scales, self._voc_perms, self._voc_inv_perms
+        )
+        frames = rotated.reshape(batch_size, seq_len * self.frames_per_token, self.spec_dim)
+        polar_spec = self.norm_out(frames) * F.softplus(self.output_scale)
+
+        waveform = None
+        if return_waveform:
+            spec_pairs = polar_spec.float().view(batch_size, -1, self.n_freq_bins, 2).transpose(1, 2).contiguous()
+            complex_spec = torch.view_as_complex(spec_pairs)
+            window = self.window.to(device=polar_spec.device, dtype=torch.float32)
+            if window.numel() != self.win_length:
+                window = torch.hann_window(self.win_length, device=polar_spec.device, dtype=torch.float32)
+            waveform = torch.istft(
+                complex_spec,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=window,
+                center=True,
+            )
+        return polar_spec, waveform
+
+
+def _polar_spectrogram_loss(pred_spec: torch.Tensor, target_spec: torch.Tensor) -> torch.Tensor:
+    """Polar spectrogram MSE + planar-pair cosine phase coherence loss."""
+    t_len = min(pred_spec.shape[1], target_spec.shape[1])
+    pred_s = pred_spec[:, :t_len].float()
+    targ_s = target_spec[:, :t_len].to(device=pred_s.device, dtype=torch.float32)
+    mse_loss = F.mse_loss(pred_s, targ_s)
+    pred_pairs = pred_s.unflatten(-1, (-1, 2))
+    targ_pairs = targ_s.unflatten(-1, (-1, 2))
+    cos_sim = F.cosine_similarity(pred_pairs, targ_pairs, dim=-1, eps=1e-6)
+    phase_loss = (1.0 - cos_sim).mean()
+    return mse_loss + 0.25 * phase_loss
+
+
+@auto_docstring(
+    custom_intro="""
+    Base class for GRT-TTS causal language and rotational speech synthesis outputs.
+    """
+)
+@dataclass
+class GRTTTSOutputWithPast(ModelOutput):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` or `target_spec` is provided):
+        Combined language modeling and polar spectrogram coherence loss.
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.text_config.vocab_size)`):
+        Prediction scores of the rotational cosine language modeling head.
+    speech_spec (`torch.FloatTensor` of shape `(batch_size, sequence_length * frames_per_token, 2 * n_freq_bins)`):
+        Predicted polar STFT planar pairs synthesized by `GRTPolarVocoderHead`.
+    speech_waveform (`torch.FloatTensor` of shape `(batch_size, num_samples)`, *optional*):
+        Time-domain waveform reconstructed via inverse STFT when `return_waveform=True`.
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance.
+    """
+
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    speech_spec: torch.FloatTensor | None = None
+    speech_waveform: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
+
+
+@auto_docstring
+class GRTTTSForConditionalGeneration(GRTPreTrainedModel, GenerationMixin):
+    config: GRTTTSConfig
+    _tied_weights_keys = {"lm_head.phase_angles": "model.embedding.phase_angles"}
+
+    def __init__(self, config: GRTTTSConfig):
+        super().__init__(config)
+        self.model = GRTModel(config.text_config)
+        self.lm_head = GRTCosineHead(config.text_config)
+        self.speech_head = GRTPolarVocoderHead(config.audio_config, in_hidden_size=config.text_config.hidden_size)
+        self.post_init()
+        if config.tie_word_embeddings:
+            self.lm_head.phase_angles = self.model.embedding.phase_angles
+
+    def get_input_embeddings(self):
+        return self.model.embedding
+
+    def set_input_embeddings(self, value):
+        self.model.embedding = value
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        target_spec: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        return_waveform: bool = True,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> GRTTTSOutputWithPast:
+        r"""
+        target_spec (`torch.FloatTensor` of shape `(batch_size, num_frames, 2 * n_freq_bins)`, *optional*):
+            Target polar STFT planar pairs for supervised vocoder training.
+        return_waveform (`bool`, *optional*, defaults to `True`):
+            Whether to reconstruct the time-domain speech waveform via `torch.istft`.
+        """
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+        hidden_states = slice_logits_to_keep(outputs.last_hidden_state, logits_to_keep)
+        logits = self.lm_head(hidden_states)
+        speech_spec, speech_waveform = self.speech_head(outputs.last_hidden_state, return_waveform=return_waveform)
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+            )
+        if target_spec is not None:
+            spec_loss = _polar_spectrogram_loss(speech_spec, target_spec)
+            loss = spec_loss if loss is None else loss + spec_loss
+
+        return GRTTTSOutputWithPast(
+            loss=loss,
+            logits=logits,
+            speech_spec=speech_spec,
+            speech_waveform=speech_waveform,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    @torch.no_grad()
+    def synthesize_speech(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Synthesize a speech waveform and polar spectrogram directly from `input_ids`."""
+        outputs = self.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_waveform=True,
+            use_cache=False,
+            **kwargs,
+        )
+        return outputs.speech_waveform, outputs.speech_spec
+
+
+@auto_docstring(
+    custom_intro="""
+    Base class for GRT-Omni outputs, with hidden states, attentions, and projected rotational image and audio states.
+    """
+)
+@dataclass
+class GRTOmniModelOutputWithPast(BaseModelOutputWithPast):
+    r"""
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance.
+    image_hidden_states (`torch.FloatTensor`, *optional*):
+        A `torch.FloatTensor` of size `(batch_size, num_image_tokens, hidden_size)` produced by `GRTVisionModel`.
+    audio_hidden_states (`torch.FloatTensor`, *optional*):
+        A `torch.FloatTensor` of size `(batch_size, num_audio_tokens, hidden_size)` produced by `GRTAudioModel`.
+    """
+
+    image_hidden_states: torch.FloatTensor | None = None
+    audio_hidden_states: torch.FloatTensor | None = None
+
+
+@auto_docstring(
+    custom_intro="""
+    Base class for GRT-Omni multimodal causal language model and speech synthesis outputs.
+    """
+)
+@dataclass
+class GRTOmniCausalLMOutputWithPast(ModelOutput):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` or `target_spec` is provided):
+        Language modeling and/or polar spectrogram speech synthesis loss.
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.text_config.vocab_size)`):
+        Prediction scores of the rotational cosine language modeling head.
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance.
+    image_hidden_states (`torch.FloatTensor`, *optional*):
+        A `torch.FloatTensor` of size `(batch_size, num_image_tokens, hidden_size)` produced by `GRTVisionModel`.
+    audio_hidden_states (`torch.FloatTensor`, *optional*):
+        A `torch.FloatTensor` of size `(batch_size, num_audio_tokens, hidden_size)` produced by `GRTAudioModel`.
+    speech_spec (`torch.FloatTensor`, *optional*):
+        Predicted polar STFT planar pairs synthesized by `GRTPolarVocoderHead` when `return_speech=True`.
+    speech_waveform (`torch.FloatTensor`, *optional*):
+        Time-domain waveform reconstructed via inverse STFT when `return_speech=True` and `return_waveform=True`.
+    """
+
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
+    image_hidden_states: torch.FloatTensor | None = None
+    audio_hidden_states: torch.FloatTensor | None = None
+    speech_spec: torch.FloatTensor | None = None
+    speech_waveform: torch.FloatTensor | None = None
+
+
+@auto_docstring
+class GRTOmniModel(GRTPreTrainedModel):
+    config: GRTOmniConfig
+    base_model_prefix = "model"
+
+    def __init__(self, config: GRTOmniConfig):
+        super().__init__(config)
+        self.visual = GRTVisionModel(config.vision_config, out_hidden_size=config.text_config.hidden_size)
+        self.audio_tower = GRTAudioModel(config.audio_config, out_hidden_size=config.text_config.hidden_size)
+        self.language_model = GRTModel(config.text_config)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.language_model.embedding
+
+    def set_input_embeddings(self, value):
+        self.language_model.embedding = value
+
+    @can_return_tuple
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        return self.visual(pixel_values=pixel_values, **kwargs)
+
+    @can_return_tuple
+    def get_audio_features(
+        self,
+        audio_values: torch.FloatTensor,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPooling:
+        return self.audio_tower(audio_values=audio_values, **kwargs)
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.LongTensor | None,
+        inputs_embeds: torch.FloatTensor,
+        features: torch.FloatTensor,
+        token_id: int,
+        modality_name: str = "image",
+    ) -> torch.Tensor:
+        if input_ids is None:
+            token_embed = self.get_input_embeddings()(
+                torch.tensor(token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_mask = (inputs_embeds == token_embed).all(-1)
+        else:
+            special_mask = input_ids == token_id
+
+        n_tokens = int(special_mask.sum().item())
+        n_features = features.shape[0] * features.shape[1]
+        if n_tokens != n_features:
+            raise ValueError(
+                f"{modality_name.capitalize()} features and placeholder tokens (id={token_id}) do not match: "
+                f"got {n_tokens} tokens in `input_ids` vs {n_features} features ({features.shape})."
+            )
+        return special_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        audio_values: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> GRTOmniModelOutputWithPast:
+        r"""
+        audio_values (`torch.FloatTensor` of shape `(batch_size, num_samples)` or `(batch_size, num_frames, spec_dim)`, *optional*):
+            Raw 1D audio waveform or pre-computed polar STFT frame features to be encoded by `GRTAudioModel`.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        image_features = None
+        if pixel_values is not None:
+            vision_outputs = self.get_image_features(pixel_values, return_dict=True)
+            image_features = vision_outputs.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
+            special_image_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds, image_features, self.config.image_token_id, modality_name="image"
+            )
+            mask_2d = special_image_mask[..., 0]
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[mask_2d] = image_features.reshape(-1, inputs_embeds.shape[-1])
+
+        audio_features = None
+        if audio_values is not None:
+            audio_outputs = self.get_audio_features(audio_values, return_dict=True)
+            audio_features = audio_outputs.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
+            special_audio_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds, audio_features, self.config.audio_token_id, modality_name="audio"
+            )
+            mask_2d = special_audio_mask[..., 0]
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[mask_2d] = audio_features.reshape(-1, inputs_embeds.shape[-1])
+
+        outputs = self.language_model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        return GRTOmniModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=image_features,
+            audio_hidden_states=audio_features,
+        )
+
+
+@auto_docstring
+class GRTOmniForConditionalGeneration(GRTPreTrainedModel, GenerationMixin):
+    config: GRTOmniConfig
+    _tied_weights_keys = {"lm_head.phase_angles": "model.language_model.embedding.phase_angles"}
+
+    def __init__(self, config: GRTOmniConfig):
+        super().__init__(config)
+        self.model = GRTOmniModel(config)
+        self.lm_head = GRTCosineHead(config.text_config)
+        self.speech_head = GRTPolarVocoderHead(config.audio_config, in_hidden_size=config.text_config.hidden_size)
+        self.post_init()
+        if config.tie_word_embeddings:
+            self.lm_head.phase_angles = self.model.language_model.embedding.phase_angles
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.model.set_input_embeddings(value)
+
+    def get_encoder(self, modality: str = "image"):
+        if modality == "image":
+            return self.model.visual
+        if modality == "audio":
+            return self.model.audio_tower
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    @property
+    def language_model(self):
+        return self.model.language_model
+
+    @property
+    def visual(self):
+        return self.model.visual
+
+    @property
+    def audio_tower(self):
+        return self.model.audio_tower
+
+    def get_image_features(self, pixel_values: torch.FloatTensor, **kwargs: Unpack[TransformersKwargs]):
+        return self.model.get_image_features(pixel_values, **kwargs)
+
+    def get_audio_features(self, audio_values: torch.FloatTensor, **kwargs: Unpack[TransformersKwargs]):
+        return self.model.get_audio_features(audio_values, **kwargs)
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        is_first_iteration: bool | None = False,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            is_first_iteration=is_first_iteration,
+            **kwargs,
+        )
+        if not is_first_iteration and kwargs.get("use_cache", True):
+            model_inputs.pop("audio_values", None)
+        return model_inputs
+
+    @torch.no_grad()
+    def quantize_weights(self, bits: int = 8):
+        self.model.visual.quantize_weights(bits)
+        self.model.audio_tower.quantize_weights(bits)
+        self.model.language_model.quantize_weights(bits)
+        pa = self.model.language_model.embedding.phase_angles
+        unit_table = None
+        if pa.numel() > 0:
+            unit_table = torch.stack([torch.cos(pa), torch.sin(pa)], dim=-1).flatten(-2) * (pa.shape[-1] ** -0.5)
+        shared_q = (
+            self.model.language_model.embedding._table_q
+            if getattr(self.config, "tie_word_embeddings", True)
+            else None
+        )
+        self.lm_head.quantize_weights(bits, unit_table=unit_table, shared_qweight=shared_q)
+        return self
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        audio_values: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        target_spec: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        return_speech: bool = False,
+        return_waveform: bool = True,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> GRTOmniCausalLMOutputWithPast:
+        r"""
+        audio_values (`torch.FloatTensor` of shape `(batch_size, num_samples)` or `(batch_size, num_frames, spec_dim)`, *optional*):
+            Raw 1D audio waveform or pre-computed polar STFT frame features to be encoded by `GRTAudioModel`.
+        target_spec (`torch.FloatTensor` of shape `(batch_size, num_frames, 2 * n_freq_bins)`, *optional*):
+            Target polar STFT planar pairs for supervised vocoder training.
+        return_speech (`bool`, *optional*, defaults to `False`):
+            Whether to run `speech_head` (`GRTPolarVocoderHead`) and return `speech_spec` / `speech_waveform`.
+        return_waveform (`bool`, *optional*, defaults to `True`):
+            Whether to reconstruct the time-domain speech waveform via `torch.istft` when `speech_head` is active.
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            audio_values=audio_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+        hidden_states = slice_logits_to_keep(outputs.last_hidden_state, logits_to_keep)
+        logits = self.lm_head(hidden_states)
+
+        speech_spec = None
+        speech_waveform = None
+        if return_speech or target_spec is not None:
+            speech_spec, speech_waveform = self.speech_head(
+                outputs.last_hidden_state, return_waveform=return_waveform
+            )
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+            )
+        if target_spec is not None and speech_spec is not None:
+            spec_loss = _polar_spectrogram_loss(speech_spec, target_spec)
+            loss = spec_loss if loss is None else loss + spec_loss
+
+        return GRTOmniCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=outputs.image_hidden_states,
+            audio_hidden_states=outputs.audio_hidden_states,
+            speech_spec=speech_spec,
+            speech_waveform=speech_waveform,
+        )
+
+    @torch.no_grad()
+    def synthesize_speech(
+        self,
+        input_ids: torch.LongTensor,
+        pixel_values: torch.FloatTensor | None = None,
+        audio_values: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Synthesize a speech waveform and polar spectrogram from multimodal `input_ids`, `pixel_values`, and `audio_values`."""
+        outputs = self.forward(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            audio_values=audio_values,
+            attention_mask=attention_mask,
+            return_speech=True,
+            return_waveform=True,
+            use_cache=False,
+            **kwargs,
+        )
+        return outputs.speech_waveform, outputs.speech_spec
+
+
 __all__ = [
+    "GRTAudioModel",
     "GRTForCausalLM",
     "GRTForSequenceClassification",
     "GRTModel",
+    "GRTOmniForConditionalGeneration",
+    "GRTOmniModel",
     "GRTPreTrainedModel",
+    "GRTTTSForConditionalGeneration",
     "GRTVisionModel",
     "GRTVLForConditionalGeneration",
     "GRTVLModel",

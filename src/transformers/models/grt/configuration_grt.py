@@ -329,4 +329,261 @@ class GRTVLConfig(PreTrainedConfig):
         return grid * grid
 
 
-__all__ = ["GRTConfig", "GRTVisionConfig", "GRTVLConfig"]
+@auto_docstring(checkpoint="matterwaveai/grt-30m-omni")
+@strict
+class GRTAudioConfig(PreTrainedConfig):
+    r"""
+    sample_rate (`int`, *optional*, defaults to 16000):
+        Target audio waveform sampling rate in Hz.
+    n_fft (`int`, *optional*, defaults to 254):
+        FFT window size used by the polar STFT stem and inverse-STFT vocoder (`n_freq_bins = n_fft // 2 + 1 = 128`).
+    hop_length (`int`, *optional*, defaults to 160):
+        STFT hop length in samples (10 ms at 16 kHz).
+    win_length (`int`, *optional*, defaults to 254):
+        STFT Hann window length in samples.
+    max_audio_frames (`int`, *optional*, defaults to 128):
+        Number of STFT frames processed per audio window before temporal rotational merging.
+    temporal_merge_size (`int`, *optional*, defaults to 2):
+        Consecutive frame folding factor merged by `GRTTemporalRotationalMerger`.
+    stem_n_rotations (`int`, *optional*, defaults to 11):
+        Number of Givens butterfly rotation stages in `GRTPolarAudioStem`.
+    merger_n_rotations (`int`, *optional*, defaults to 15):
+        Number of Givens butterfly rotation stages in `GRTTemporalRotationalMerger`.
+    vocoder_n_rotations (`int`, *optional*, defaults to 15):
+        Number of Givens butterfly rotation stages in `GRTPolarVocoderHead`.
+    frames_per_token (`int`, *optional*, defaults to 4):
+        Number of STFT frames synthesized per language token by `GRTPolarVocoderHead`.
+    ffn_n_rotations (`int`, *optional*, defaults to 21):
+        Number of rotation stages in each of the audio feed-forward expand and contract chains.
+    n_qkv_rotations (`int`, *optional*, defaults to 11):
+        Number of rotation stages in each of the audio Q/K/V/O projection chains.
+    n_mixer_rotations (`int`, *optional*, defaults to 1):
+        Number of rotation stages in the cross-head audio mixer.
+    coupling_init_scale (`float`, *optional*, defaults to 0.01):
+        Standard deviation used to initialize the coupling tensors that modulate rotation angles by content.
+    angle_init_scale (`float`, *optional*, defaults to 0.1):
+        Standard deviation used to initialize the rotation angles.
+    pos_freq_base (`float`, *optional*, defaults to 10000.0):
+        Base of the geometric frequency ladder used by the rotational position encoding.
+    learnable_rope (`bool`, *optional*, defaults to `True`):
+        Whether the audio position frequencies are learned parameters.
+    coupling_init_mode (`str`, *optional*, defaults to `"diagonal"`):
+        Coupling initialization: `"diagonal"` adds a self-coupling term on top of the random init, `"random"` does not.
+    learnable_residual_gates (`bool`, *optional*, defaults to `True`):
+        Whether each residual branch is scaled by a learned gate.
+    residual_gate_mode (`str`, *optional*, defaults to `"bounded_depth"`):
+        Gate parameterization, one of `"free"`, `"bounded"`, `"bounded_depth"` or `"none"`.
+    residual_norm_mode (`str`, *optional*, defaults to `"none"`):
+        `"pearlnorm"` normalizes the residual stream after every block, `"none"` does not.
+    peri_ln (`bool`, *optional*, defaults to `False`):
+        Whether to normalize the attention and feed-forward outputs before they enter the residual stream.
+    is_causal (`bool`, *optional*, defaults to `False`):
+        Whether audio encoder blocks apply a causal mask (defaults to `False` for bidirectional audio encoding).
+    """
+
+    model_type = "grt_audio"
+
+    sample_rate: int = 16000
+    n_fft: int = 254
+    hop_length: int = 160
+    win_length: int = 254
+    max_audio_frames: int = 128
+    temporal_merge_size: int = 2
+    hidden_size: int = 256
+    intermediate_size: int | None = None
+    num_hidden_layers: int = 4
+    num_attention_heads: int = 4
+    stem_n_rotations: int = 11
+    merger_n_rotations: int = 15
+    vocoder_n_rotations: int = 15
+    frames_per_token: int = 4
+    ffn_n_rotations: int = 21
+    n_qkv_rotations: int = 11
+    n_mixer_rotations: int = 1
+    attention_dropout: float | int = 0.0
+    coupling_init_scale: float = 0.01
+    angle_init_scale: float = 0.1
+    pos_freq_base: float = 10000.0
+    learnable_rope: bool = True
+    coupling_init_mode: Literal["diagonal", "random"] = "diagonal"
+    learnable_residual_gates: bool = True
+    residual_gate_mode: Literal["free", "bounded", "bounded_depth", "none"] = "bounded_depth"
+    residual_norm_mode: Literal["none", "pearlnorm"] = "none"
+    peri_ln: bool = False
+    is_causal: bool = False
+    initializer_range: float = 0.02
+
+    def __post_init__(self, **kwargs):
+        super().__post_init__(**kwargs)
+        if self.intermediate_size is None:
+            self.intermediate_size = 4 * self.hidden_size
+
+    @property
+    def n_freq_bins(self) -> int:
+        return self.n_fft // 2 + 1
+
+    @property
+    def spec_dim(self) -> int:
+        return 2 * (self.n_fft // 2 + 1)
+
+    @property
+    def n_q_rotations(self) -> int:
+        return self.n_qkv_rotations
+
+    @property
+    def n_k_rotations(self) -> int:
+        return self.n_qkv_rotations
+
+    @property
+    def n_v_rotations(self) -> int:
+        return self.n_qkv_rotations
+
+    @property
+    def n_o_rotations(self) -> int:
+        return self.n_qkv_rotations
+
+    @property
+    def num_key_value_heads(self) -> int:
+        return self.num_attention_heads
+
+    @property
+    def rope_placement(self) -> str:
+        return "stream"
+
+    @property
+    def ffn_n_experts(self) -> int:
+        return 0
+
+    @property
+    def mor_mode(self) -> str:
+        return "direct"
+
+    @property
+    def mor_delta_scale(self) -> float:
+        return 0.5
+
+    @property
+    def mor_router_mode(self) -> str:
+        return "rotational"
+
+    @property
+    def mor_split_routers(self) -> bool:
+        return False
+
+    @property
+    def mor_top_k(self) -> int | None:
+        return None
+
+    def validate_architecture(self):
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"`hidden_size` ({self.hidden_size}) must be divisible by `num_attention_heads` "
+                f"({self.num_attention_heads})."
+            )
+        head_dim = self.hidden_size // self.num_attention_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"`head_dim` ({head_dim}) must be even.")
+        if self.max_audio_frames % self.temporal_merge_size != 0:
+            raise ValueError(
+                f"`max_audio_frames` ({self.max_audio_frames}) must be divisible by `temporal_merge_size` "
+                f"({self.temporal_merge_size})."
+            )
+
+
+@auto_docstring(checkpoint="matterwaveai/grt-30m-tts")
+@strict
+class GRTTTSConfig(PreTrainedConfig):
+    r"""
+    audio_config (`dict` or `GRTAudioConfig`, *optional*):
+        Configuration for the 100% rotational polar vocoder head (`GRTPolarVocoderHead`).
+    text_config (`dict` or `GRTConfig`, *optional*):
+        Configuration for the rotational language backbone (`GRTModel`).
+    audio_token_id (`int`, *optional*, defaults to 151656):
+        Token ID representing `<|video_pad|>` / audio placeholder tokens.
+    """
+
+    model_type = "grt_tts"
+    keys_to_ignore_at_inference = ["past_key_values"]
+    sub_configs = {"audio_config": GRTAudioConfig, "text_config": GRTConfig}
+
+    audio_config: PreTrainedConfig | dict[str, Any] | None = None
+    text_config: PreTrainedConfig | dict[str, Any] | None = None
+    audio_token_id: int = 151656
+    tie_word_embeddings: bool = True
+
+    def __post_init__(self, **kwargs):
+        if isinstance(self.audio_config, dict):
+            self.audio_config = GRTAudioConfig(**self.audio_config)
+        elif self.audio_config is None:
+            self.audio_config = GRTAudioConfig()
+
+        if isinstance(self.text_config, dict):
+            self.text_config = GRTConfig(**self.text_config)
+        elif self.text_config is None:
+            self.text_config = GRTConfig(vocab_size=151669, tie_word_embeddings=self.tie_word_embeddings)
+
+        super().__post_init__(**kwargs)
+
+
+@auto_docstring(checkpoint="matterwaveai/grt-30m-omni")
+@strict
+class GRTOmniConfig(PreTrainedConfig):
+    r"""
+    vision_config (`dict` or `GRTVisionConfig`, *optional*):
+        Configuration for the 100% rotational vision encoder (`GRTVisionModel`).
+    audio_config (`dict` or `GRTAudioConfig`, *optional*):
+        Configuration for the 100% rotational audio encoder (`GRTAudioModel`) and speech vocoder (`GRTPolarVocoderHead`).
+    text_config (`dict` or `GRTConfig`, *optional*):
+        Configuration for the rotational language backbone (`GRTModel`).
+    image_token_id (`int`, *optional*, defaults to 151655):
+        Token ID representing `<|image_pad|>` placeholders where projected visual planar-pair tokens are scattered.
+    vision_start_token_id (`int`, *optional*, defaults to 151652):
+        Token ID representing `<|vision_start|>`.
+    vision_end_token_id (`int`, *optional*, defaults to 151653):
+        Token ID representing `<|vision_end|>`.
+    audio_token_id (`int`, *optional*, defaults to 151656):
+        Token ID representing `<|video_pad|>` / audio placeholders where projected audio planar-pair tokens are scattered.
+    """
+
+    model_type = "grt_omni"
+    keys_to_ignore_at_inference = ["past_key_values"]
+    sub_configs = {"vision_config": GRTVisionConfig, "audio_config": GRTAudioConfig, "text_config": GRTConfig}
+
+    vision_config: PreTrainedConfig | dict[str, Any] | None = None
+    audio_config: PreTrainedConfig | dict[str, Any] | None = None
+    text_config: PreTrainedConfig | dict[str, Any] | None = None
+    image_token_id: int = 151655
+    vision_start_token_id: int = 151652
+    vision_end_token_id: int = 151653
+    audio_token_id: int = 151656
+    tie_word_embeddings: bool = True
+
+    def __post_init__(self, **kwargs):
+        if isinstance(self.vision_config, dict):
+            self.vision_config = GRTVisionConfig(**self.vision_config)
+        elif self.vision_config is None:
+            self.vision_config = GRTVisionConfig()
+
+        if isinstance(self.audio_config, dict):
+            self.audio_config = GRTAudioConfig(**self.audio_config)
+        elif self.audio_config is None:
+            self.audio_config = GRTAudioConfig()
+
+        if isinstance(self.text_config, dict):
+            self.text_config = GRTConfig(**self.text_config)
+        elif self.text_config is None:
+            self.text_config = GRTConfig(vocab_size=151669, tie_word_embeddings=self.tie_word_embeddings)
+
+        super().__post_init__(**kwargs)
+
+    @property
+    def num_image_tokens(self) -> int:
+        grid = self.vision_config.image_size // (self.vision_config.patch_size * self.vision_config.spatial_merge_size)
+        return grid * grid
+
+    @property
+    def num_audio_tokens(self) -> int:
+        return self.audio_config.max_audio_frames // self.audio_config.temporal_merge_size
+
+
+__all__ = ["GRTAudioConfig", "GRTConfig", "GRTOmniConfig", "GRTTTSConfig", "GRTVisionConfig", "GRTVLConfig"]

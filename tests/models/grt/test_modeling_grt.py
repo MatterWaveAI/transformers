@@ -28,9 +28,17 @@ if is_torch_available():
     import torch
 
     from transformers import (
+        GRTAudioConfig,
+        GRTAudioModel,
         GRTForCausalLM,
         GRTForSequenceClassification,
         GRTModel,
+        GRTOmniConfig,
+        GRTOmniForConditionalGeneration,
+        GRTOmniModel,
+        GRTOmniProcessor,
+        GRTTTSConfig,
+        GRTTTSForConditionalGeneration,
         GRTVisionConfig,
         GRTVisionModel,
         GRTVLConfig,
@@ -394,5 +402,139 @@ class GRTVLModelTest(unittest.TestCase):
             out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         self.assertEqual(tuple(out.logits.shape), (2, 1))
         self.assertIsNotNone(out.loss)
+
+    def _tiny_audio_config(self) -> "GRTAudioConfig":
+        return GRTAudioConfig(
+            sample_rate=16000,
+            n_fft=30,
+            hop_length=16,
+            win_length=30,
+            max_audio_frames=8,
+            temporal_merge_size=2,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            stem_n_rotations=3,
+            merger_n_rotations=3,
+            vocoder_n_rotations=3,
+            frames_per_token=2,
+            ffn_n_rotations=3,
+            n_qkv_rotations=2,
+            n_mixer_rotations=1,
+        )
+
+    def test_audio_model_and_tts_zero_linear_and_conv1d(self):
+        """GRTAudioModel and GRTTTSForConditionalGeneration must have 0 nn.Linear and 0 nn.Conv1d layers."""
+        audio_cfg = self._tiny_audio_config()
+        text_cfg = GRTConfig(
+            vocab_size=256,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            ffn_n_rotations=3,
+            n_qkv_rotations=2,
+            n_mixer_rotations=1,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+        )
+        audio_model = GRTAudioModel(audio_cfg).to(torch_device).eval()
+        for _, mod in audio_model.named_modules():
+            self.assertNotIsInstance(mod, (torch.nn.Linear, torch.nn.Conv1d))
+
+        # Test both raw 1D waveform [B, T_samples] and pre-framed polar STFT [B, T_frames, 2 * F]
+        raw_wave = torch.randn(2, 160, device=torch_device)
+        with torch.no_grad():
+            out_wave = audio_model(raw_wave)
+        self.assertEqual(tuple(out_wave.last_hidden_state.shape), (2, 8, 32))
+        self.assertEqual(tuple(out_wave.pooler_output.shape), (2, 4, 32))
+
+        tts_cfg = GRTTTSConfig(audio_config=audio_cfg, text_config=text_cfg)
+        tts_model = GRTTTSForConditionalGeneration(tts_cfg).to(torch_device)
+        for _, mod in tts_model.named_modules():
+            self.assertNotIsInstance(mod, (torch.nn.Linear, torch.nn.Conv1d))
+
+        input_ids = torch.tensor([[1, 10, 20, 30, 2]], device=torch_device)
+        target_spec = torch.randn(1, 10, audio_cfg.spec_dim, device=torch_device)
+        out_tts = tts_model(input_ids=input_ids, labels=input_ids, target_spec=target_spec, return_waveform=True)
+        self.assertIsNotNone(out_tts.loss)
+        self.assertEqual(tuple(out_tts.logits.shape), (1, 5, 256))
+        self.assertEqual(tuple(out_tts.speech_spec.shape), (1, 10, audio_cfg.spec_dim))
+        self.assertIsNotNone(out_tts.speech_waveform)
+        self.assertEqual(out_tts.speech_waveform.shape[0], 1)
+
+        out_tts.loss.backward()
+        waveform, spec = tts_model.synthesize_speech(input_ids=input_ids)
+        self.assertEqual(tuple(spec.shape), (1, 10, audio_cfg.spec_dim))
+        self.assertEqual(waveform.shape[0], 1)
+
+    def test_omni_model_forward_generate_speech_and_processor(self):
+        """GRTOmniForConditionalGeneration fuses Vision + Audio + Text + Speech with 0 nn.Linear and 0 nn.Conv1d."""
+        vl_cfg = self._tiny_vl_config()
+        audio_cfg = self._tiny_audio_config()
+        omni_cfg = GRTOmniConfig(
+            vision_config=vl_cfg.vision_config,
+            audio_config=audio_cfg,
+            text_config=vl_cfg.text_config,
+            image_token_id=250,
+            vision_start_token_id=248,
+            vision_end_token_id=249,
+            audio_token_id=251,
+        )
+        self.assertEqual(omni_cfg.num_image_tokens, 4)
+        self.assertEqual(omni_cfg.num_audio_tokens, 4)
+
+        model = GRTOmniForConditionalGeneration(omni_cfg).to(torch_device)
+        for _, mod in model.named_modules():
+            self.assertNotIsInstance(mod, (torch.nn.Linear, torch.nn.Conv1d))
+
+        # Sequence with 4 image tokens (250) and 4 audio tokens (251)
+        input_ids = torch.tensor([[1, 248, 250, 250, 250, 250, 249, 251, 251, 251, 251, 10, 11]], device=torch_device)
+        pixel_values = torch.randn(1, 3, 28, 28, device=torch_device)
+        audio_values = torch.randn(1, 160, device=torch_device)
+        labels = input_ids.clone()
+        labels[:, :11] = -100
+        target_spec = torch.randn(1, 26, audio_cfg.spec_dim, device=torch_device)
+
+        out = model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            audio_values=audio_values,
+            labels=labels,
+            target_spec=target_spec,
+            return_speech=True,
+            return_waveform=True,
+        )
+        self.assertIsNotNone(out.loss)
+        self.assertEqual(tuple(out.logits.shape), (1, 13, 256))
+        self.assertEqual(tuple(out.image_hidden_states.shape), (1, 4, 32))
+        self.assertEqual(tuple(out.audio_hidden_states.shape), (1, 4, 32))
+        self.assertEqual(tuple(out.speech_spec.shape), (1, 26, audio_cfg.spec_dim))
+        self.assertIsNotNone(out.speech_waveform)
+        out.loss.backward()
+
+        model.eval()
+        with torch.no_grad():
+            waveform, spec = model.synthesize_speech(
+                input_ids=input_ids, pixel_values=pixel_values, audio_values=audio_values
+            )
+            self.assertEqual(tuple(spec.shape), (1, 26, audio_cfg.spec_dim))
+            self.assertEqual(waveform.shape[0], 1)
+
+            gen = model.generate(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                audio_values=audio_values,
+                max_new_tokens=3,
+                do_sample=False,
+            )
+            self.assertEqual(tuple(gen.shape), (1, 16))
+
+        proc = GRTOmniProcessor(image_seq_length=4, audio_seq_length=4)
+        expanded = proc.replace_audio_token("Listen: <|video_pad|>")
+        self.assertEqual(expanded, "Listen: " + "<|video_pad|>" * 4)
+
 
 

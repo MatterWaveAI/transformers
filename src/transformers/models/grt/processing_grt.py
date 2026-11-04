@@ -53,12 +53,17 @@ class GRTVLProcessor(ProcessorMixin):
         image_tokens_expanded = self.image_token * self.image_seq_length
         self.full_image_sequence = f"{self.vision_start_token}{image_tokens_expanded}{self.vision_end_token}"
 
-        super().__init__(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            **kwargs,
-        )
+        if image_processor is not None and tokenizer is not None:
+            super().__init__(
+                image_processor=image_processor,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                **kwargs,
+            )
+        else:
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
 
     @auto_docstring
     def __call__(
@@ -101,4 +106,41 @@ class GRTVLProcessor(ProcessorMixin):
         return self.full_image_sequence
 
 
-__all__ = ["GRTVLProcessor"]
+@auto_docstring
+class GRTOmniProcessor(GRTVLProcessor):
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        chat_template=None,
+        image_seq_length: int = 64,
+        audio_seq_length: int = 64,
+        **kwargs,
+    ):
+        r"""
+        image_seq_length (`int`, *optional*, defaults to 64):
+            Number of `<|image_pad|>` tokens expanded per image.
+        audio_seq_length (`int`, *optional*, defaults to 64):
+            Number of `<|video_pad|>` audio placeholder tokens expanded per audio segment.
+        """
+        self.audio_seq_length = audio_seq_length
+        self.audio_token = "<|video_pad|>"
+        self.audio_token_id = (
+            tokenizer.convert_tokens_to_ids(self.audio_token) if tokenizer is not None else 151656
+        )
+        self.full_audio_sequence = self.audio_token * self.audio_seq_length
+        super().__init__(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            image_seq_length=image_seq_length,
+            **kwargs,
+        )
+
+    def replace_audio_token(self, prompt: str | None = None, **kwargs) -> str:
+        if isinstance(prompt, str):
+            return prompt.replace(self.audio_token, self.full_audio_sequence)
+        return self.full_audio_sequence
+
+
+__all__ = ["GRTOmniProcessor", "GRTVLProcessor"]

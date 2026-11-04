@@ -99,6 +99,7 @@ else:
             ("git", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
             ("granite4_vision", {"torchvision": "LlavaNextImageProcessor", "pil": "LlavaNextImageProcessorPil"}),
             ("groupvit", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
+            ("grt_omni", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
             ("grt_vl", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
             ("hiera", {"torchvision": "BitImageProcessor", "pil": "BitImageProcessorPil"}),
             (

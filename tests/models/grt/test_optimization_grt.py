@@ -20,9 +20,14 @@ import torch
 import torch.nn.functional as F
 
 from transformers import (
+    GRTAudioConfig,
     GRTConfig,
     GRTForCausalLM,
     GRTForSequenceClassification,
+    GRTOmniConfig,
+    GRTOmniForConditionalGeneration,
+    GRTTTSConfig,
+    GRTTTSForConditionalGeneration,
     GRTVisionConfig,
     GRTVisionModel,
     GRTVLConfig,
@@ -45,15 +50,14 @@ class GRTOptimizationTest(unittest.TestCase):
             hidden_size=32,
             num_hidden_layers=2,
             num_attention_heads=4,
-            num_key_value_heads=2,
             intermediate_size=64,
-            n_q_rotations=2,
-            n_k_rotations=2,
-            n_v_rotations=2,
-            n_o_rotations=2,
+            n_qkv_rotations=2,
             n_mixer_rotations=1,
             ffn_n_rotations=2,
             max_position_embeddings=64,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
         )
         defaults.update(overrides)
         return GRTConfig(**defaults)
@@ -122,10 +126,7 @@ class GRTOptimizationTest(unittest.TestCase):
             spatial_merge_size=2,
             patch_n_rotations=2,
             merger_n_rotations=2,
-            n_q_rotations=2,
-            n_k_rotations=2,
-            n_v_rotations=2,
-            n_o_rotations=2,
+            n_qkv_rotations=2,
             n_mixer_rotations=1,
             ffn_n_rotations=2,
         )
@@ -134,6 +135,38 @@ class GRTOptimizationTest(unittest.TestCase):
         vl_partners = pair_model_angles_and_scales(vl_model)
         self.assertIn(id(vl_model.visual.patch_embed.angles), vl_partners)
         self.assertIn(id(vl_model.visual.merger.expand_angles), vl_partners)
+
+        aud_cfg = GRTAudioConfig(
+            n_fft=30,
+            hop_length=16,
+            win_length=30,
+            max_audio_frames=8,
+            temporal_merge_size=2,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            stem_n_rotations=2,
+            merger_n_rotations=2,
+            vocoder_n_rotations=2,
+            frames_per_token=2,
+            ffn_n_rotations=2,
+            n_qkv_rotations=2,
+            n_mixer_rotations=1,
+        )
+        tts_model = GRTTTSForConditionalGeneration(GRTTTSConfig(audio_config=aud_cfg, text_config=self._tiny_config()))
+        tts_partners = pair_model_angles_and_scales(tts_model)
+        for name, p in tts_model.named_parameters():
+            if "angle" in name:
+                self.assertIn(id(p), tts_partners, f"Unpaired TTS angle param {name}")
+
+        omni_model = GRTOmniForConditionalGeneration(
+            GRTOmniConfig(vision_config=vis_cfg, audio_config=aud_cfg, text_config=self._tiny_config())
+        )
+        omni_partners = pair_model_angles_and_scales(omni_model)
+        for name, p in omni_model.named_parameters():
+            if "angle" in name:
+                self.assertIn(id(p), omni_partners, f"Unpaired Omni angle param {name}")
 
     def test_hessian_pair_adam_step_and_configure_optimizers(self):
         """GRTPreTrainedModel.configure_optimizers(hessian_mode=True) decreases loss on CausalLM."""

@@ -156,6 +156,8 @@ class OptimizerNames(ExplicitEnum):
     APOLLO_ADAMW = "apollo_adamw"
     APOLLO_ADAMW_LAYERWISE = "apollo_adamw_layerwise"
     STABLE_ADAMW = "stable_adamw"
+    PAIR_ADAM = "pair_adam"
+    HESSIAN_PAIR_ADAM = "hessian_pair_adam"
 
 
 def _convert_str_dict(passed_value: dict):

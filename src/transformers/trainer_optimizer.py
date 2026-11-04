@@ -198,6 +198,45 @@ def _get_adafactor(ctx: OptimizerContext) -> tuple[Any, dict[str, Any]]:
     return Adafactor, ctx.optimizer_kwargs
 
 
+def _get_grt_pair_adam(ctx: OptimizerContext) -> tuple[Any, dict[str, Any]]:
+    """Get GRT PairAdam or HessianPairAdam (Sophia-Torus) optimizer."""
+    from .models.grt.optimization_grt import HessianPairAdam, PairAdam, build_grt_param_groups
+
+    hessian_mode = ctx.args.optim == OptimizerNames.HESSIAN_PAIR_ADAM
+    opt_cls = HessianPairAdam if hessian_mode else PairAdam
+    ctx.optimizer_kwargs.update(ctx.adam_kwargs)
+    ctx.optimizer_kwargs["weight_decay"] = ctx.args.weight_decay
+    ctx.optimizer_kwargs["hessian_mode"] = hessian_mode
+
+    for float_key in (
+        "max_angular_step",
+        "gamma_gn",
+        "curv_weight",
+        "tau_saddle",
+        "eps_kick",
+        "antipodal_kick",
+        "eps_h",
+        "sophia_rho",
+    ):
+        if float_key in ctx.optim_args:
+            ctx.optimizer_kwargs[float_key] = float(ctx.optim_args[float_key])
+    if "nesterov" in ctx.optim_args:
+        ctx.optimizer_kwargs["nesterov"] = bool(strtobool(ctx.optim_args["nesterov"]))
+
+    if ctx.model is not None:
+        param_groups = build_grt_param_groups(
+            ctx.model,
+            lr=ctx.args.learning_rate,
+            weight_decay=ctx.args.weight_decay,
+            hessian_mode=hessian_mode,
+            max_angular_step=ctx.optimizer_kwargs.get("max_angular_step", 0.5 if hessian_mode else None),
+            nesterov=ctx.optimizer_kwargs.get("nesterov", hessian_mode),
+        )
+        if param_groups:
+            ctx.optimizer_kwargs["params"] = param_groups
+    return opt_cls, ctx.optimizer_kwargs
+
+
 def _get_adamw_torch(ctx: OptimizerContext) -> tuple[Any, dict[str, Any]]:
     """Get PyTorch AdamW optimizer (regular or fused)."""
     from torch.optim import AdamW
@@ -612,6 +651,8 @@ _OPTIMIZER_HANDLERS: dict[str, OptimizerHandler] = {
     OptimizerNames.RMSPROP: _get_rmsprop,
     OptimizerNames.GROKADAMW: _get_grokadamw,
     OptimizerNames.STABLE_ADAMW: _get_stable_adamw,
+    OptimizerNames.PAIR_ADAM: _get_grt_pair_adam,
+    OptimizerNames.HESSIAN_PAIR_ADAM: _get_grt_pair_adam,
     OptimizerNames.LOMO: _get_lomo_optimizer,
     OptimizerNames.ADALOMO: _get_lomo_optimizer,
     **dict.fromkeys(_BITSANDBYTES_OPTIMIZERS, _get_bitsandbytes_optimizer),

@@ -1340,3 +1340,14 @@ def get_adafactor_schedule(optimizer, initial_lr=0.0):
 
     """
     return AdafactorSchedule(optimizer, initial_lr)
+
+
+from .models.grt.optimization_grt import (  # noqa: E402
+    HessianPairAdam,
+    PairAdam,
+    build_grt_optimizer,
+    build_grt_param_groups,
+    compute_intrinsic_angle_hessian,
+    pair_model_angles_and_scales,
+)
+

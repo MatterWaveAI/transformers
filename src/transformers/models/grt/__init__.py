@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from .feature_extraction_grt import *
     from .image_processing_grt import *
     from .modeling_grt import *
+    from .onnx_grt import *
     from .optimization_grt import *
     from .processing_grt import *
 else:

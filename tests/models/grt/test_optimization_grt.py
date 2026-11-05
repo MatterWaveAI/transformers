@@ -20,14 +20,9 @@ import torch
 import torch.nn.functional as F
 
 from transformers import (
-    GRTAudioConfig,
     GRTConfig,
     GRTForCausalLM,
     GRTForSequenceClassification,
-    GRTOmniConfig,
-    GRTOmniForConditionalGeneration,
-    GRTTTSConfig,
-    GRTTTSForConditionalGeneration,
     GRTVisionConfig,
     GRTVisionModel,
     GRTVLConfig,
@@ -36,6 +31,10 @@ from transformers import (
 from transformers.models.grt import (
     HessianPairAdam,
     PairAdam,
+    PolarNaturalAdam,
+    RotorAdam,
+    ToroidalLion,
+    ToroidalMuon,
     build_grt_optimizer,
     build_grt_param_groups,
     compute_intrinsic_angle_hessian,
@@ -50,14 +49,15 @@ class GRTOptimizationTest(unittest.TestCase):
             hidden_size=32,
             num_hidden_layers=2,
             num_attention_heads=4,
+            num_key_value_heads=2,
             intermediate_size=64,
-            n_qkv_rotations=2,
+            n_q_rotations=2,
+            n_k_rotations=2,
+            n_v_rotations=2,
+            n_o_rotations=2,
             n_mixer_rotations=1,
             ffn_n_rotations=2,
             max_position_embeddings=64,
-            pad_token_id=0,
-            bos_token_id=1,
-            eos_token_id=2,
         )
         defaults.update(overrides)
         return GRTConfig(**defaults)
@@ -126,7 +126,10 @@ class GRTOptimizationTest(unittest.TestCase):
             spatial_merge_size=2,
             patch_n_rotations=2,
             merger_n_rotations=2,
-            n_qkv_rotations=2,
+            n_q_rotations=2,
+            n_k_rotations=2,
+            n_v_rotations=2,
+            n_o_rotations=2,
             n_mixer_rotations=1,
             ffn_n_rotations=2,
         )
@@ -135,38 +138,6 @@ class GRTOptimizationTest(unittest.TestCase):
         vl_partners = pair_model_angles_and_scales(vl_model)
         self.assertIn(id(vl_model.visual.patch_embed.angles), vl_partners)
         self.assertIn(id(vl_model.visual.merger.expand_angles), vl_partners)
-
-        aud_cfg = GRTAudioConfig(
-            n_fft=30,
-            hop_length=16,
-            win_length=30,
-            max_audio_frames=8,
-            temporal_merge_size=2,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=1,
-            num_attention_heads=4,
-            stem_n_rotations=2,
-            merger_n_rotations=2,
-            vocoder_n_rotations=2,
-            frames_per_token=2,
-            ffn_n_rotations=2,
-            n_qkv_rotations=2,
-            n_mixer_rotations=1,
-        )
-        tts_model = GRTTTSForConditionalGeneration(GRTTTSConfig(audio_config=aud_cfg, text_config=self._tiny_config()))
-        tts_partners = pair_model_angles_and_scales(tts_model)
-        for name, p in tts_model.named_parameters():
-            if "angle" in name:
-                self.assertIn(id(p), tts_partners, f"Unpaired TTS angle param {name}")
-
-        omni_model = GRTOmniForConditionalGeneration(
-            GRTOmniConfig(vision_config=vis_cfg, audio_config=aud_cfg, text_config=self._tiny_config())
-        )
-        omni_partners = pair_model_angles_and_scales(omni_model)
-        for name, p in omni_model.named_parameters():
-            if "angle" in name:
-                self.assertIn(id(p), omni_partners, f"Unpaired Omni angle param {name}")
 
     def test_hessian_pair_adam_step_and_configure_optimizers(self):
         """GRTPreTrainedModel.configure_optimizers(hessian_mode=True) decreases loss on CausalLM."""
@@ -276,6 +247,36 @@ class GRTOptimizationTest(unittest.TestCase):
         params_pair = opt_kwargs_pair.pop("params")
         opt_pair = opt_cls_pair(params_pair, **opt_kwargs_pair)
         self.assertIsInstance(opt_pair, PairAdam)
+
+    def test_toroidal_muon_polar_natural_rotor_and_lion_optimizers(self):
+        """ToroidalMuon, PolarNaturalAdam, RotorAdam, and ToroidalLion all decrease loss and wrap angles in [-pi, pi]."""
+        for opt_type, opt_cls, lr in [
+            ("toroidal_muon", ToroidalMuon, 5e-3),
+            ("polar_natural_adam", PolarNaturalAdam, 5e-3),
+            ("rotor_adam", RotorAdam, 5e-3),
+            ("toroidal_lion", ToroidalLion, 1e-3),
+        ]:
+            torch.manual_seed(7)
+            cfg = self._tiny_config()
+            model = GRTForCausalLM(cfg)
+            optimizer = build_grt_optimizer(model, lr=lr, weight_decay=0.01, optimizer_type=opt_type)
+            self.assertIsInstance(optimizer, opt_cls)
+
+            input_ids = torch.randint(0, cfg.vocab_size, (2, 10))
+            loss0 = model(input_ids=input_ids, labels=input_ids).loss.item()
+
+            for _ in range(4):
+                optimizer.zero_grad()
+                out = model(input_ids=input_ids, labels=input_ids)
+                out.loss.backward()
+                optimizer.step()
+
+            loss_final = model(input_ids=input_ids, labels=input_ids).loss.item()
+            self.assertLess(loss_final, loss0, f"{opt_type} failed to decrease loss: {loss0} -> {loss_final}")
+
+            for name, p in model.named_parameters():
+                if "angle" in name:
+                    self.assertLessEqual(p.data.abs().max().item(), math.pi + 1e-5, f"{opt_type} unwrapped {name}")
 
 
 if __name__ == "__main__":

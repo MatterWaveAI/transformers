@@ -586,4 +586,51 @@ class GRTOmniConfig(PreTrainedConfig):
         return self.audio_config.max_audio_frames // self.audio_config.temporal_merge_size
 
 
-__all__ = ["GRTAudioConfig", "GRTConfig", "GRTOmniConfig", "GRTTTSConfig", "GRTVisionConfig", "GRTVLConfig"]
+@auto_docstring(checkpoint="matterwaveai/grt-30m-asr")
+@strict
+class GRTASRConfig(PreTrainedConfig):
+    r"""
+    audio_config (`dict` or `GRTAudioConfig`, *optional*):
+        Configuration for the 100% rotational audio encoder (`GRTAudioModel`).
+    text_config (`dict` or `GRTConfig`, *optional*):
+        Configuration for the rotational language backbone (`GRTModel`) and cosine LM head (`GRTCosineHead`).
+    audio_token_id (`int`, *optional*, defaults to 151656):
+        Token ID representing `<|video_pad|>` / audio placeholders where projected audio planar-pair tokens are scattered.
+    """
+
+    model_type = "grt_asr"
+    keys_to_ignore_at_inference = ["past_key_values"]
+    sub_configs = {"audio_config": GRTAudioConfig, "text_config": GRTConfig}
+
+    audio_config: PreTrainedConfig | dict[str, Any] | None = None
+    text_config: PreTrainedConfig | dict[str, Any] | None = None
+    audio_token_id: int = 151656
+    tie_word_embeddings: bool = True
+
+    def __post_init__(self, **kwargs):
+        if isinstance(self.audio_config, dict):
+            self.audio_config = GRTAudioConfig(**self.audio_config)
+        elif self.audio_config is None:
+            self.audio_config = GRTAudioConfig()
+
+        if isinstance(self.text_config, dict):
+            self.text_config = GRTConfig(**self.text_config)
+        elif self.text_config is None:
+            self.text_config = GRTConfig(vocab_size=151669, tie_word_embeddings=self.tie_word_embeddings)
+
+        super().__post_init__(**kwargs)
+
+    @property
+    def num_audio_tokens(self) -> int:
+        return self.audio_config.max_audio_frames // self.audio_config.temporal_merge_size
+
+
+__all__ = [
+    "GRTASRConfig",
+    "GRTAudioConfig",
+    "GRTConfig",
+    "GRTOmniConfig",
+    "GRTTTSConfig",
+    "GRTVisionConfig",
+    "GRTVLConfig",
+]

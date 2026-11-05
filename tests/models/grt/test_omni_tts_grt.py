@@ -20,6 +20,9 @@ import unittest
 import torch
 
 from transformers import (
+    GRTASRConfig,
+    GRTASRForConditionalGeneration,
+    GRTASRModel,
     GRTAudioConfig,
     GRTAudioModel,
     GRTConfig,
@@ -229,6 +232,41 @@ class GRTOmniTTSTest(unittest.TestCase):
             proc.replace_image_token("Img: <|image_pad|>"),
             "Img: <|vision_start|>" + "<|image_pad|>" * 4 + "<|vision_end|>",
         )
+
+    def test_grt_asr_for_conditional_generation(self):
+        torch.manual_seed(7)
+        audio_cfg = self._tiny_audio_config()
+        text_cfg = self._tiny_text_config()
+        asr_cfg = GRTASRConfig(
+            audio_config=audio_cfg,
+            text_config=text_cfg,
+            audio_token_id=251,
+        )
+        self.assertEqual(asr_cfg.model_type, "grt_asr")
+        self.assertEqual(asr_cfg.num_audio_tokens, 4)
+
+        model = GRTASRForConditionalGeneration(asr_cfg)
+        self.assertIsInstance(model.model, GRTASRModel)
+        self.assertIs(model.lm_head.phase_angles, model.model.language_model.embedding.phase_angles)
+        for mod in model.modules():
+            self.assertNotIsInstance(mod, (torch.nn.Linear, torch.nn.Conv1d))
+
+        audio_values = torch.randn(1, 160)
+        # Direct audio-to-logits forward (no input_ids)
+        out_direct = model(audio_values=audio_values)
+        self.assertEqual(tuple(out_direct.logits.shape), (1, 4, 256))
+        self.assertEqual(tuple(out_direct.audio_hidden_states.shape), (1, 4, 32))
+
+        # Multimodal prompt with audio placeholder tokens
+        input_ids = torch.tensor([[1, 251, 251, 251, 251, 10, 11]])
+        labels = input_ids.clone()
+        labels[:, :5] = -100
+        out = model(input_ids=input_ids, audio_values=audio_values, labels=labels)
+        self.assertIsNotNone(out.loss)
+        self.assertEqual(tuple(out.logits.shape), (1, 7, 256))
+
+        pred_ids = model.transcribe(audio_values=audio_values)
+        self.assertEqual(tuple(pred_ids.shape), (1, 4))
 
 
 if __name__ == "__main__":

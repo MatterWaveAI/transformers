@@ -31,6 +31,10 @@ from transformers import (
 from transformers.models.grt import (
     HessianPairAdam,
     PairAdam,
+    PolarNaturalAdam,
+    RotorAdam,
+    ToroidalLion,
+    ToroidalMuon,
     build_grt_optimizer,
     build_grt_param_groups,
     compute_intrinsic_angle_hessian,
@@ -243,6 +247,36 @@ class GRTOptimizationTest(unittest.TestCase):
         params_pair = opt_kwargs_pair.pop("params")
         opt_pair = opt_cls_pair(params_pair, **opt_kwargs_pair)
         self.assertIsInstance(opt_pair, PairAdam)
+
+    def test_toroidal_muon_polar_natural_rotor_and_lion_optimizers(self):
+        """ToroidalMuon, PolarNaturalAdam, RotorAdam, and ToroidalLion all decrease loss and wrap angles in [-pi, pi]."""
+        for opt_type, opt_cls, lr in [
+            ("toroidal_muon", ToroidalMuon, 5e-3),
+            ("polar_natural_adam", PolarNaturalAdam, 5e-3),
+            ("rotor_adam", RotorAdam, 5e-3),
+            ("toroidal_lion", ToroidalLion, 1e-3),
+        ]:
+            torch.manual_seed(7)
+            cfg = self._tiny_config()
+            model = GRTForCausalLM(cfg)
+            optimizer = build_grt_optimizer(model, lr=lr, weight_decay=0.01, optimizer_type=opt_type)
+            self.assertIsInstance(optimizer, opt_cls)
+
+            input_ids = torch.randint(0, cfg.vocab_size, (2, 10))
+            loss0 = model(input_ids=input_ids, labels=input_ids).loss.item()
+
+            for _ in range(4):
+                optimizer.zero_grad()
+                out = model(input_ids=input_ids, labels=input_ids)
+                out.loss.backward()
+                optimizer.step()
+
+            loss_final = model(input_ids=input_ids, labels=input_ids).loss.item()
+            self.assertLess(loss_final, loss0, f"{opt_type} failed to decrease loss: {loss0} -> {loss_final}")
+
+            for name, p in model.named_parameters():
+                if "angle" in name:
+                    self.assertLessEqual(p.data.abs().max().item(), math.pi + 1e-5, f"{opt_type} unwrapped {name}")
 
 
 if __name__ == "__main__":

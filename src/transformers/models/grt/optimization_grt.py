@@ -763,6 +763,586 @@ class HessianPairAdam(PairAdam):
                 g0["weight_decay"] = 0.0
 
 
+@torch.no_grad()
+def _zeropower_via_newtonschulz5(g: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Batched quintic Newton-Schulz orthogonalization across butterfly cascade stages.
+
+    Supports 2D `[n_stages, n_pairs]` and 3D `[n_stages, n_heads, n_pairs]` angle update tensors
+    (transposing 3D tensors to `[n_heads, n_stages, n_pairs]` so each attention head's `n_stages x n_pairs`
+    cascade is orthogonalized independently).
+    """
+    orig_dtype = g.dtype
+    was_3d = g.dim() == 3
+    if was_3d:
+        # [K, H, P] -> [H, K, P]
+        x = g.permute(1, 0, 2).to(dtype=torch.float32)
+    elif g.dim() == 2:
+        x = g.unsqueeze(0).to(dtype=torch.float32)
+    else:
+        return g
+
+    transposed = x.shape[-2] > x.shape[-1]
+    if transposed:
+        x = x.transpose(-2, -1)
+
+    norm = x.norm(dim=(-2, -1), keepdim=True).clamp(min=eps)
+    x = x / norm
+
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    for _ in range(steps):
+        xxt = torch.matmul(x, x.transpose(-2, -1))
+        b_mat = b * xxt + c * torch.matmul(xxt, xxt)
+        x = a * x + torch.matmul(b_mat, x)
+
+    if transposed:
+        x = x.transpose(-2, -1)
+
+    if was_3d:
+        return x.permute(1, 0, 2).to(dtype=orig_dtype)
+    return x.squeeze(0).to(dtype=orig_dtype)
+
+
+@torch.no_grad()
+def _compute_polar_pair_radius_sq(
+    angle_param: torch.Tensor,
+    paired_raw_scale: torch.Tensor | None = None,
+    is_log_magnitude: bool = False,
+    group_scale_partners: dict | None = None,
+) -> torch.Tensor:
+    """Compute effective planar pair radius squared `r_p^2 = 0.5 * (softplus(s_{2p})^2 + softplus(s_{2p+1})^2)`."""
+    if paired_raw_scale is None:
+        paired_raw_scale, is_log_magnitude = _resolve_scale_partner(angle_param, group_scale_partners)
+    if paired_raw_scale is None:
+        return torch.ones_like(angle_param)
+
+    work_dtype = torch.float64 if paired_raw_scale.dtype == torch.float64 else torch.float32
+    if is_log_magnitude or (
+        paired_raw_scale.dim() == 1
+        and angle_param.dim() == 2
+        and paired_raw_scale.shape[0] == angle_param.shape[0]
+    ):
+        r_sq = torch.exp(2.0 * paired_raw_scale.detach().to(dtype=work_dtype).clamp(-5.0, 5.0))
+        return r_sq.unsqueeze(-1).expand_as(angle_param).to(dtype=angle_param.dtype)
+
+    if paired_raw_scale.numel() == 2 * angle_param.numel():
+        s_act = F.softplus(paired_raw_scale.detach().to(dtype=work_dtype))
+        s_pairs = s_act.reshape(*angle_param.shape, 2)
+        r_sq = 0.5 * (s_pairs[..., 0].square() + s_pairs[..., 1].square())
+        return r_sq.to(dtype=angle_param.dtype)
+
+    if paired_raw_scale.shape == angle_param.shape:
+        s_act = F.softplus(paired_raw_scale.detach().to(dtype=work_dtype))
+        return s_act.square().to(dtype=angle_param.dtype)
+
+    return torch.ones_like(angle_param)
+
+
+class ToroidalMuon(HessianPairAdam):
+    """Stage-Orthogonalized Toroidal Optimizer (`ToroidalMuon` / `StageMuonPairAdam`) for GRT.
+
+    Applies quintic Newton-Schulz orthogonalization across the butterfly cascade stages `[n_stages, n_pairs]`
+    (or per-head `[n_stages, n_heads, n_pairs]`) of GRT rotation angle tensors so that adjacent butterfly
+    stages learn mutually orthogonal phase updates on the flat torus `T^P = (S^1)^P`, blended (`muon_mix`)
+    with the RMS-matched `HessianPairAdam` (`Sophia-Torus`) curvature-preconditioned step before wrapping
+    into `[-pi, pi]`.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        ns_steps: int = 5,
+        muon_mix: float = 0.35,
+        max_cascade_stages: int = 256,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        for g in self.param_groups:
+            g.setdefault("ns_steps", ns_steps)
+            g.setdefault("muon_mix", muon_mix)
+            g.setdefault("max_cascade_stages", max_cascade_stages)
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        limit = (max_ang / lr) if (max_ang is not None and lr > 0.0) else None
+        if sophia_rho is not None and sophia_rho > 0.0:
+            limit = min(limit, sophia_rho) if limit is not None else sophia_rho
+
+        ns_steps = self.defaults.get("ns_steps", 5)
+        muon_mix = self.defaults.get("muon_mix", 0.35)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            update = m_eff / pos_curv
+
+            # Apply Newton-Schulz stage orthogonalization on multi-stage butterfly cascades
+            if (
+                muon_mix > 0.0
+                and p.dim() in (2, 3)
+                and 1 < p.shape[0] <= max_cascade_stages
+                and p.shape[-1] > 1
+            ):
+                ortho = _zeropower_via_newtonschulz5(m_eff, steps=ns_steps)
+                # Match the RMS magnitude of the curvature-preconditioned update so lr semantics stay identical
+                target_rms = update.square().mean().sqrt().clamp(min=1e-12)
+                ortho_rms = ortho.square().mean().sqrt().clamp(min=1e-12)
+                ortho_scaled = ortho * (target_rms / ortho_rms)
+                update = (1.0 - muon_mix) * update + muon_mix * ortho_scaled
+
+            if limit is not None:
+                update.clamp_(-limit, limit)
+
+            p.add_(update, alpha=-lr)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+class PolarNaturalAdam(HessianPairAdam):
+    """Riemannian Polar Metric + Cauchy-Riemann Hessian Optimizer (`PolarNaturalAdam`) for GRT.
+
+    Preconditions angular updates on `T^P = (S^1)^P` using both:
+      1. The exact polar Riemannian metric `ds^2 = dr^2 + r^2 d(theta)^2` from the paired radial scale
+         tensor `r_p^2 = 0.5 * (softplus(s_{2p})^2 + softplus(s_{2p+1})^2)` (scaling angular updates by
+         `r_p^(-2 * polar_exponent)` normalized to unit mean across the stage so overall learning rate is preserved), and
+      2. The analytical Cauchy-Riemann toroidal curvature `c_theta` from Theorem 2.1.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        polar_exponent: float = 0.5,
+        polar_min_radius_sq: float = 0.25,
+        polar_max_radius_sq: float = 4.0,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["polar_exponent"] = polar_exponent
+        self.defaults["polar_min_radius_sq"] = polar_min_radius_sq
+        self.defaults["polar_max_radius_sq"] = polar_max_radius_sq
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        limit = (max_ang / lr) if (max_ang is not None and lr > 0.0) else None
+        if sophia_rho is not None and sophia_rho > 0.0:
+            limit = min(limit, sophia_rho) if limit is not None else sophia_rho
+
+        polar_exp = self.defaults.get("polar_exponent", 0.5)
+        r_min_sq = self.defaults.get("polar_min_radius_sq", 0.25)
+        r_max_sq = self.defaults.get("polar_max_radius_sq", 4.0)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            r_sq = _compute_polar_pair_radius_sq(p).clamp(min=r_min_sq, max=r_max_sq)
+            inv_metric = r_sq.pow(-polar_exp)
+            inv_metric = inv_metric / inv_metric.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            update = (m_eff * inv_metric) / pos_curv
+            if limit is not None:
+                update.clamp_(-limit, limit)
+
+            p.add_(update, alpha=-lr)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+class RotorAdam(HessianPairAdam):
+    """Lie-Algebra Cayley-Retraction Optimizer (`RotorAdam` / `CayleyRotorAdam`) for GRT.
+
+    Replaces Euclidean additive clipping on `T^P = (S^1)^P` with the smooth rational Cayley
+    retraction map on `SO(2)^P`:
+
+        `Delta theta = -2 * cayley_radius * arctan((lr * u) / (2 * cayley_radius))`
+
+    which equals `-lr * u + O((lr * u)^3)` for small updates while smoothly saturating at
+    `+-pi * cayley_radius` without hard clipping discontinuities, and applies exact `so(3)`
+    geodesic wrapping on 3D rotor parameters (`is_rotor3=True`).
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        cayley_radius: float = 0.05,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["cayley_radius"] = cayley_radius
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        # Smooth Cayley asymptotic radius (matches max_angular_step when set)
+        asym_rad = max_ang if (max_ang is not None and max_ang > 0.0) else self.defaults.get("cayley_radius", 0.05)
+        cayley_scale = 2.0 * asym_rad / math.pi
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            raw_step = lr * (m_eff / pos_curv)
+            # Smooth rational Cayley retraction: maps (-inf, inf) -> (-asym_rad, +asym_rad) with unit slope at 0
+            delta_theta = -2.0 * cayley_scale * torch.atan(raw_step / (2.0 * cayley_scale))
+            p.add_(delta_theta)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+class ToroidalLion(Optimizer):
+    """Sign-Momentum Toroidal Optimizer (`ToroidalLion` / `SignMomentumTorus`) for GRT.
+
+    Adapts Chen et al.'s `Lion` (EvoLved Sign Momentum) to the flat torus `T^P = (S^1)^P` with:
+      - Interpolated momentum `c_t = beta1 * m_{t-1} + (1 - beta1) * g_t`,
+      - Optional smooth sign `tanh(c_t / sign_temperature)` (or exact `sign(c_t)` when `sign_temperature=0`)
+        so every rotation plane advances at a uniform radian rate without second-moment state overhead,
+      - Optional Theorem 2.1 antipodal saddle-point escape kicks on angle parameters, and
+      - Exact `[-pi, pi]` toroidal wrapping and zero weight decay on angles.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 3e-5,
+        betas: tuple[float, float] = (0.9, 0.99),
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        sign_temperature: float = 0.0,
+        hessian_mode: bool = True,
+        tau_saddle: float = 1e-4,
+        antipodal_kick: float = 0.2,
+        scale_partners: dict | None = None,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid betas: {betas}")
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            sign_temperature=sign_temperature,
+            hessian_mode=hessian_mode,
+            tau_saddle=tau_saddle,
+            antipodal_kick=antipodal_kick,
+        )
+        super().__init__(params, defaults)
+        if scale_partners is not None:
+            for group in self.param_groups:
+                group.setdefault("scale_partners", {}).update(scale_partners)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            wd = group["weight_decay"]
+            is_angle = group.get("is_angle", False) or (group.get("group_type") == "angle")
+            is_rotor3 = group.get("is_rotor3", False)
+            max_ang = group.get("max_angular_step", group.get("max_step", None))
+            sign_temp = group.get("sign_temperature", 0.0)
+            hessian_mode = group.get("hessian_mode", False)
+            tau_saddle = group.get("tau_saddle", 1e-4)
+            antipodal_kick = group.get("antipodal_kick", 0.2)
+            scale_partners = group.get("scale_partners", None)
+
+            eff_lr = min(lr, max_ang) if (max_ang is not None and lr > max_ang) else lr
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p)
+
+                state["step"] += 1
+                exp_avg = state["exp_avg"]
+
+                if wd != 0.0 and not is_angle and not is_rotor3:
+                    p.mul_(1.0 - eff_lr * wd)
+
+                c_t = exp_avg * beta1 + grad * (1.0 - beta1)
+
+                if is_angle and hessian_mode:
+                    c_theta = compute_intrinsic_angle_hessian(p, group_scale_partners=scale_partners)
+                    at_saddle = (c_theta < -tau_saddle) & (c_t.abs() <= c_theta.abs())
+                    kick_sign = torch.where(c_t >= 0.0, torch.ones_like(c_t), -torch.ones_like(c_t))
+                    c_t = torch.where(at_saddle, c_t + kick_sign * (antipodal_kick * c_theta.abs()), c_t)
+
+                if sign_temp > 0.0:
+                    rms = c_t.square().mean().sqrt().clamp(min=1e-12)
+                    update = torch.tanh(c_t / (sign_temp * rms))
+                else:
+                    update = torch.sign(c_t)
+
+                if is_rotor3:
+                    _clamp_rotor3_update_(update, 1.0)
+                    p.add_(update, alpha=-eff_lr)
+                    _wrap_rotor3_(p.data)
+                else:
+                    p.add_(update, alpha=-eff_lr)
+                    if is_angle:
+                        p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+                exp_avg.mul_(beta2).add_(grad, alpha=1.0 - beta2)
+
+        return loss
+
+
 def build_grt_param_groups(
     model: nn.Module,
     lr: float = 1e-3,
@@ -893,6 +1473,7 @@ def build_grt_optimizer(
     eps: float = 1e-8,
     weight_decay: float = 0.01,
     hessian_mode: bool = True,
+    optimizer_type: str | None = None,
     angle_lr_mult: float = 1.0,
     scale_lr_mult: float = 1.0,
     coupling_lr_mult: float = 3.0,
@@ -912,8 +1493,9 @@ def build_grt_optimizer(
     antipodal_kick: float = 0.2,
     eps_h: float = 1e-6,
     sophia_rho: float = 5.0,
-) -> PairAdam:
-    """Construct a `HessianPairAdam` (when `hessian_mode=True`) or `PairAdam` optimizer for `model`."""
+    **kwargs,
+) -> Optimizer:
+    """Construct a GRT toroidal optimizer (`HessianPairAdam`, `PairAdam`, `ToroidalMuon`, `PolarNaturalAdam`, `RotorAdam`, or `ToroidalLion`)."""
     param_groups = build_grt_param_groups(
         model,
         lr=lr,
@@ -932,7 +1514,29 @@ def build_grt_optimizer(
         nesterov=nesterov,
         hessian_mode=hessian_mode,
     )
-    opt_cls = HessianPairAdam if hessian_mode else PairAdam
+    opt_key = (optimizer_type or ("hessian_pair_adam" if hessian_mode else "pair_adam")).lower()
+    if opt_key == "toroidal_lion":
+        return ToroidalLion(
+            param_groups,
+            lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            hessian_mode=hessian_mode,
+            tau_saddle=tau_saddle,
+            antipodal_kick=antipodal_kick,
+            **kwargs,
+        )
+    opt_map = {
+        "pair_adam": PairAdam,
+        "hessian_pair_adam": HessianPairAdam,
+        "toroidal_muon": ToroidalMuon,
+        "polar_natural_adam": PolarNaturalAdam,
+        "rotor_adam": RotorAdam,
+    }
+    if opt_key not in opt_map:
+        raise ValueError(f"Unknown GRT optimizer_type={optimizer_type!r}. Expected one of { sorted([*opt_map, 'toroidal_lion']) }.")
+    opt_cls = opt_map[opt_key]
     return opt_cls(
         param_groups,
         lr=lr,
@@ -941,7 +1545,7 @@ def build_grt_optimizer(
         weight_decay=weight_decay,
         max_angular_step=max_angular_step,
         nesterov=nesterov,
-        hessian_mode=hessian_mode,
+        hessian_mode=hessian_mode if opt_key != "pair_adam" else False,
         gamma_gn=gamma_gn,
         curv_weight=curv_weight,
         tau_saddle=tau_saddle,
@@ -949,12 +1553,17 @@ def build_grt_optimizer(
         antipodal_kick=antipodal_kick,
         eps_h=eps_h,
         sophia_rho=sophia_rho,
+        **kwargs,
     )
 
 
 __all__ = [
     "HessianPairAdam",
     "PairAdam",
+    "PolarNaturalAdam",
+    "RotorAdam",
+    "ToroidalLion",
+    "ToroidalMuon",
     "build_grt_optimizer",
     "build_grt_param_groups",
     "compute_intrinsic_angle_hessian",

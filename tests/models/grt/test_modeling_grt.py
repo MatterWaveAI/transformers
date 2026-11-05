@@ -28,10 +28,23 @@ if is_torch_available():
     import torch
 
     from transformers import (
+        AutoFeatureExtractor,
+        AutoImageProcessor,
+        AutoModelForImageTextToText,
+        AutoModelForSpeechSeq2Seq,
+        AutoModelForTextToSpectrogram,
+        AutoModelForTextToWaveform,
+        AutoProcessor,
+        GRTASRConfig,
+        GRTASRForConditionalGeneration,
+        GRTASRModel,
+        GRTASRProcessor,
         GRTAudioConfig,
+        GRTAudioFeatureExtractor,
         GRTAudioModel,
         GRTForCausalLM,
         GRTForSequenceClassification,
+        GRTImageProcessor,
         GRTModel,
         GRTOmniConfig,
         GRTOmniForConditionalGeneration,
@@ -535,6 +548,168 @@ class GRTVLModelTest(unittest.TestCase):
         proc = GRTOmniProcessor(image_seq_length=4, audio_seq_length=4)
         expanded = proc.replace_audio_token("Listen: <|video_pad|>")
         self.assertEqual(expanded, "Listen: " + "<|video_pad|>" * 4)
+
+    def test_processors_image_audio_and_auto_mappings(self):
+        """Test GRTImageProcessor, GRTAudioFeatureExtractor, GRTVLProcessor, GRTASRProcessor, GRTOmniProcessor, and Auto* mappings."""
+        import numpy as np
+
+        from transformers.models.auto.feature_extraction_auto import FEATURE_EXTRACTOR_MAPPING_NAMES
+        from transformers.models.auto.image_processing_auto import IMAGE_PROCESSOR_MAPPING_NAMES
+        from transformers.models.auto.modeling_auto import (
+            MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+            MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES,
+            MODEL_FOR_TEXT_TO_SPECTROGRAM_MAPPING_NAMES,
+            MODEL_FOR_TEXT_TO_WAVEFORM_MAPPING_NAMES,
+        )
+        from transformers.models.auto.processing_auto import PROCESSOR_MAPPING_NAMES
+
+        # 1. Verify Auto* registry entries
+        for model_type in ("grt", "grt_vl", "grt_omni"):
+            self.assertIn(model_type, IMAGE_PROCESSOR_MAPPING_NAMES)
+        for model_type in ("grt", "grt_asr", "grt_tts", "grt_omni"):
+            self.assertIn(model_type, FEATURE_EXTRACTOR_MAPPING_NAMES)
+            self.assertEqual(FEATURE_EXTRACTOR_MAPPING_NAMES[model_type], "GRTAudioFeatureExtractor")
+        self.assertEqual(PROCESSOR_MAPPING_NAMES.get("grt_vl"), "GRTVLProcessor")
+        self.assertEqual(PROCESSOR_MAPPING_NAMES.get("grt_asr"), "GRTASRProcessor")
+        self.assertEqual(PROCESSOR_MAPPING_NAMES.get("grt_omni"), "GRTOmniProcessor")
+        self.assertEqual(MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES.get("grt_asr"), "GRTASRForConditionalGeneration")
+        self.assertEqual(MODEL_FOR_TEXT_TO_WAVEFORM_MAPPING_NAMES.get("grt_tts"), "GRTTTSForConditionalGeneration")
+        self.assertEqual(MODEL_FOR_TEXT_TO_SPECTROGRAM_MAPPING_NAMES.get("grt_tts"), "GRTTTSForConditionalGeneration")
+        self.assertEqual(MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.get("grt_vl"), "GRTVLForConditionalGeneration")
+        self.assertEqual(MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.get("grt_omni"), "GRTOmniForConditionalGeneration")
+
+        # 2. Test GRTImageProcessor
+        img_proc = GRTImageProcessor(size={"height": 28, "width": 28})
+        raw_img = np.random.randint(0, 256, size=(32, 40, 3), dtype=np.uint8)
+        img_batch = img_proc(raw_img, return_tensors="pt")
+        self.assertIn("pixel_values", img_batch)
+        self.assertEqual(tuple(img_batch["pixel_values"].shape), (1, 3, 28, 28))
+        self.assertTrue(torch.all(img_batch["pixel_values"] >= -1.01))
+        self.assertTrue(torch.all(img_batch["pixel_values"] <= 1.01))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            img_proc.save_pretrained(tmp_dir)
+            loaded_img_proc = AutoImageProcessor.from_pretrained(tmp_dir)
+            self.assertIsInstance(loaded_img_proc, GRTImageProcessor)
+
+        # 3. Test GRTAudioFeatureExtractor
+        feat_ext = GRTAudioFeatureExtractor(
+            sampling_rate=16000, n_fft=30, hop_length=16, win_length=30, max_audio_frames=8
+        )
+        wave_1d = np.random.randn(100).astype(np.float32)
+        wave_2d = [np.random.randn(80).astype(np.float32), np.random.randn(160).astype(np.float32)]
+        audio_batch_1d = feat_ext(wave_1d, return_tensors="pt")
+        self.assertIn("audio_values", audio_batch_1d)
+        self.assertEqual(tuple(audio_batch_1d["audio_values"].shape), (1, 100))
+        audio_batch_2d = feat_ext(wave_2d, return_tensors="pt")
+        self.assertEqual(tuple(audio_batch_2d["audio_values"].shape), (2, 160))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            feat_ext.save_pretrained(tmp_dir)
+            loaded_feat_ext = AutoFeatureExtractor.from_pretrained(tmp_dir)
+            self.assertIsInstance(loaded_feat_ext, GRTAudioFeatureExtractor)
+
+        # Dummy callable tokenizer for processor tests
+        class _DummyTokenizer:
+            def __call__(self, text, return_tensors=None, **kwargs):
+                if isinstance(text, str):
+                    text = [text]
+                ids = []
+                for t in text:
+                    row = []
+                    # Parse special tokens <|image_pad|>, <|video_pad|>, <|audio_pad|>
+                    parts = (
+                        t.replace("<|image_pad|>", " <IMG> ")
+                        .replace("<|video_pad|>", " <AUD> ")
+                        .replace("<|audio_pad|>", " <AUD> ")
+                        .split()
+                    )
+                    for p in parts:
+                        if p == "<IMG>":
+                            row.append(250)
+                        elif p == "<AUD>":
+                            row.append(251)
+                        else:
+                            row.append(10)
+                    ids.append(row)
+                max_len = max(len(r) for r in ids)
+                padded = [r + [0] * (max_len - len(r)) for r in ids]
+                mask = [[1] * len(r) + [0] * (max_len - len(r)) for r in ids]
+                if return_tensors == "pt":
+                    return {
+                        "input_ids": torch.tensor(padded, dtype=torch.long),
+                        "attention_mask": torch.tensor(mask, dtype=torch.long),
+                    }
+                return {"input_ids": padded, "attention_mask": mask}
+
+            def convert_tokens_to_ids(self, token):
+                if token == "<|image_pad|>":
+                    return 250
+                if token in ("<|video_pad|>", "<|audio_pad|>"):
+                    return 251
+                return 10
+
+            def batch_decode(self, sequences, **kwargs):
+                return ["decoded"] * len(sequences)
+
+            def decode(self, token_ids, **kwargs):
+                return "decoded"
+
+        dummy_tok = _DummyTokenizer()
+
+        # 4. Test GRTVLProcessor
+        vl_proc = GRTVLProcessor(image_processor=img_proc, tokenizer=dummy_tok, image_seq_length=4)
+        vl_inputs = vl_proc(text="Describe <|image_pad|>", images=raw_img, return_tensors="pt")
+        self.assertIn("input_ids", vl_inputs)
+        self.assertIn("attention_mask", vl_inputs)
+        self.assertIn("pixel_values", vl_inputs)
+        self.assertEqual((vl_inputs["input_ids"] == 250).sum().item(), 4)
+        self.assertEqual(tuple(vl_inputs["pixel_values"].shape), (1, 3, 28, 28))
+
+        # 5. Test GRTASRProcessor & GRTASRForConditionalGeneration
+        asr_proc = GRTASRProcessor(feature_extractor=feat_ext, tokenizer=dummy_tok, audio_seq_length=4)
+        asr_inputs = asr_proc(text="Transcribe <|video_pad|>", audio=wave_1d, return_tensors="pt")
+        self.assertIn("input_ids", asr_inputs)
+        self.assertIn("attention_mask", asr_inputs)
+        self.assertIn("audio_values", asr_inputs)
+        self.assertEqual((asr_inputs["input_ids"] == 251).sum().item(), 4)
+        self.assertEqual(tuple(asr_inputs["audio_values"].shape), (1, 100))
+
+        vl_cfg = self._tiny_vl_config()
+        audio_cfg = self._tiny_audio_config()
+        asr_cfg = GRTASRConfig(audio_config=audio_cfg, text_config=vl_cfg.text_config, audio_token_id=251)
+        asr_model = GRTASRForConditionalGeneration(asr_cfg).to(torch_device).eval()
+        with torch.no_grad():
+            asr_out = asr_model(
+                input_ids=asr_inputs["input_ids"].to(torch_device),
+                attention_mask=asr_inputs["attention_mask"].to(torch_device),
+                audio_values=asr_inputs["audio_values"].to(torch_device),
+            )
+        self.assertEqual(tuple(asr_out.logits.shape), (1, 5, 256))
+
+        # 6. Test GRTOmniProcessor with images + audio + text
+        omni_proc = GRTOmniProcessor(
+            image_processor=img_proc,
+            feature_extractor=feat_ext,
+            tokenizer=dummy_tok,
+            image_seq_length=4,
+            audio_seq_length=4,
+        )
+        omni_inputs = omni_proc(
+            text="Look <|image_pad|> and listen <|audio_pad|>",
+            images=raw_img,
+            audio=wave_1d,
+            return_tensors="pt",
+        )
+        self.assertIn("input_ids", omni_inputs)
+        self.assertIn("attention_mask", omni_inputs)
+        self.assertIn("pixel_values", omni_inputs)
+        self.assertIn("audio_values", omni_inputs)
+        self.assertEqual((omni_inputs["input_ids"] == 250).sum().item(), 4)
+        self.assertEqual((omni_inputs["input_ids"] == 251).sum().item(), 4)
+        self.assertEqual(tuple(omni_inputs["pixel_values"].shape), (1, 3, 28, 28))
+        self.assertEqual(tuple(omni_inputs["audio_values"].shape), (1, 100))
+
 
 
 

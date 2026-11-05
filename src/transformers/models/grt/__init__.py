@@ -25,6 +25,8 @@ from ...utils.import_utils import define_import_structure
 
 if TYPE_CHECKING:
     from .configuration_grt import *
+    from .feature_extraction_grt import *
+    from .image_processing_grt import *
     from .modeling_grt import *
     from .optimization_grt import *
     from .processing_grt import *

@@ -99,8 +99,10 @@ else:
             ("git", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
             ("granite4_vision", {"torchvision": "LlavaNextImageProcessor", "pil": "LlavaNextImageProcessorPil"}),
             ("groupvit", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
-            ("grt_omni", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
-            ("grt_vl", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
+            ("grt", {"torchvision": "GRTImageProcessor", "pil": "GRTImageProcessor"}),
+            ("grt_omni", {"torchvision": "GRTImageProcessor", "pil": "GRTImageProcessor"}),
+            ("grt_vision", {"torchvision": "GRTImageProcessor", "pil": "GRTImageProcessor"}),
+            ("grt_vl", {"torchvision": "GRTImageProcessor", "pil": "GRTImageProcessor"}),
             ("hiera", {"torchvision": "BitImageProcessor", "pil": "BitImageProcessorPil"}),
             (
                 "hyperclovax_vision_v2",

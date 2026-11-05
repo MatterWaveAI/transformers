@@ -1246,6 +1246,7 @@ MODEL_FOR_MULTIMODAL_LM_MAPPING_NAMES = OrderedDict(
         ("glmasr", "GlmAsrForConditionalGeneration"),
         ("granite_speech", "GraniteSpeechForConditionalGeneration"),
         ("granite_speech_plus", "GraniteSpeechPlusForConditionalGeneration"),
+        ("grt_asr", "GRTASRForConditionalGeneration"),
         ("kyutai_speech_to_text", "KyutaiSpeechToTextForConditionalGeneration"),
         ("moss_transcribe_diarize", "MossTranscribeDiarizeForConditionalGeneration"),
         ("phi4_multimodal", "Phi4MultimodalForCausalLM"),
@@ -1437,6 +1438,7 @@ MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES = OrderedDict(
         ("fun_asr_nano", "FunAsrNanoForConditionalGeneration"),
         ("granite_speech", "GraniteSpeechForConditionalGeneration"),
         ("granite_speech_plus", "GraniteSpeechPlusForConditionalGeneration"),
+        ("grt_asr", "GRTASRForConditionalGeneration"),
         ("kyutai_speech_to_text", "KyutaiSpeechToTextForConditionalGeneration"),
         ("moonshine", "MoonshineForConditionalGeneration"),
         ("moonshine_streaming", "MoonshineStreamingForConditionalGeneration"),
@@ -1937,6 +1939,7 @@ MODEL_FOR_TEXT_TO_SPECTROGRAM_MAPPING_NAMES = OrderedDict(
     [
         # Model for Text-To-Spectrogram mapping
         ("fastspeech2_conformer", "FastSpeech2ConformerModel"),
+        ("grt_tts", "GRTTTSForConditionalGeneration"),
         ("speecht5", "SpeechT5ForTextToSpeech"),
     ]
 )
@@ -1948,6 +1951,7 @@ MODEL_FOR_TEXT_TO_WAVEFORM_MAPPING_NAMES = OrderedDict(
         ("csm", "CsmForConditionalGeneration"),
         ("fastspeech2_conformer_with_hifigan", "FastSpeech2ConformerWithHifiGan"),
         ("gradium_phonon_tts", "GradiumPhononTTSForConditionalGeneration"),
+        ("grt_tts", "GRTTTSForConditionalGeneration"),
         ("higgs_audio_v2", "HiggsAudioV2ForConditionalGeneration"),
         ("musicgen", "MusicgenForConditionalGeneration"),
         ("musicgen_melody", "MusicgenMelodyForConditionalGeneration"),

@@ -1235,6 +1235,264 @@ class RotorAdam(HessianPairAdam):
             p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
 
 
+@torch.no_grad()
+def _compute_cyclide_conic_metric_sq(
+    angle_param: torch.Tensor,
+    paired_raw_scale: torch.Tensor | None = None,
+    is_log_magnitude: bool = False,
+    group_scale_partners: dict | None = None,
+    sin_theta: torch.Tensor | None = None,
+    cos_theta: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute Dupin Cyclide conic tangent metric `g_{theta,p} = a_p^2 sin^2(theta_p) + b_p^2 cos^2(theta_p)`.
+
+    For each 2D Givens pair `p` with semi-axes `a_p = softplus(s_{2p})` and `b_p = softplus(s_{2p+1})`,
+    the Brianchon tangent envelope around the ellipse `(x / a_p)^2 + (y / b_p)^2 = 1` has exact
+    phase-dependent squared tangent arc-length `a_p^2 sin^2(theta_p) + b_p^2 cos^2(theta_p)`.
+    When `a_p == b_p == r_p` (zero eccentricity), this reduces to the circular torus metric `r_p^2`.
+    """
+    if paired_raw_scale is None:
+        paired_raw_scale, is_log_magnitude = _resolve_scale_partner(angle_param, group_scale_partners)
+    if paired_raw_scale is None:
+        return torch.ones_like(angle_param)
+
+    work_dtype = torch.float64 if paired_raw_scale.dtype == torch.float64 else torch.float32
+    if paired_raw_scale.numel() == 2 * angle_param.numel():
+        s_raw = paired_raw_scale.detach()
+        if s_raw.dtype != work_dtype:
+            s_raw = s_raw.to(dtype=work_dtype)
+        s_act = F.softplus(s_raw)
+        s_pairs = s_act.reshape(*angle_param.shape, 2)
+        a_sq = s_pairs[..., 0].square()
+        b_sq = s_pairs[..., 1].square()
+        if sin_theta is not None and cos_theta is not None:
+            s_t = sin_theta if sin_theta.dtype == work_dtype else sin_theta.to(dtype=work_dtype)
+            c_t = cos_theta if cos_theta.dtype == work_dtype else cos_theta.to(dtype=work_dtype)
+            sin_sq = s_t.square()
+            cos_sq = c_t.square()
+        else:
+            theta_f = angle_param.detach()
+            if theta_f.dtype != work_dtype:
+                theta_f = theta_f.to(dtype=work_dtype)
+            sin_sq = torch.sin(theta_f).square()
+            cos_sq = 1.0 - sin_sq
+        g_conic_sq = a_sq * sin_sq + b_sq * cos_sq
+        return g_conic_sq if g_conic_sq.dtype == angle_param.dtype else g_conic_sq.to(dtype=angle_param.dtype)
+
+    if (
+        paired_raw_scale.dim() == angle_param.dim() + 1
+        and paired_raw_scale.shape[1:-1] == angle_param.shape[:-1]
+        and paired_raw_scale.shape[-1] == 2 * angle_param.shape[-1]
+    ):
+        s_raw = paired_raw_scale.detach()
+        if s_raw.dtype != work_dtype:
+            s_raw = s_raw.to(dtype=work_dtype)
+        s_act = F.softplus(s_raw)
+        s_pairs = s_act.reshape(paired_raw_scale.shape[0], *angle_param.shape, 2)
+        a_sq = s_pairs[..., 0].square().mean(dim=0)
+        b_sq = s_pairs[..., 1].square().mean(dim=0)
+        theta_f = angle_param.detach()
+        if theta_f.dtype != work_dtype:
+            theta_f = theta_f.to(dtype=work_dtype)
+        sin_sq = torch.sin(theta_f).square()
+        cos_sq = 1.0 - sin_sq
+        g_conic_sq = a_sq * sin_sq + b_sq * cos_sq
+        return g_conic_sq if g_conic_sq.dtype == angle_param.dtype else g_conic_sq.to(dtype=angle_param.dtype)
+
+    return _compute_polar_pair_radius_sq(
+        angle_param,
+        paired_raw_scale=paired_raw_scale,
+        is_log_magnitude=is_log_magnitude,
+        group_scale_partners=group_scale_partners,
+    )
+
+
+@torch.no_grad()
+def _project_cyclide_deviatoric(
+    angle_param: torch.Tensor,
+    update: torch.Tensor,
+    sin_theta: torch.Tensor | None = None,
+    cos_theta: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project out common-mode tangent drift across cascade stages (`dim=0`) in `O(K * P)` time.
+
+    Decomposes multi-stage cascade updates `[n_stages, ...]` in the local tangent frame
+    `e_{k,p} = (cos(theta_{k,p}), sin(theta_{k,p}))` and subtracts the coherent inter-stage
+    translation `1/K * sum_j cos(theta_{k,p} - theta_{j,p}) * update_{j,p}`, leaving pure
+    trace-free deviatoric twist across butterfly stages.
+    """
+    if angle_param.dim() not in (2, 3) or angle_param.shape[0] <= 1:
+        return update
+    c = cos_theta if cos_theta is not None else torch.cos(angle_param.data)
+    s = sin_theta if sin_theta is not None else torch.sin(angle_param.data)
+    mean_c = (c * update).mean(dim=0, keepdim=True)
+    mean_s = (s * update).mean(dim=0, keepdim=True)
+    common_mode = c * mean_c + s * mean_s
+    return update - common_mode
+
+
+class CyclideAdam(HessianPairAdam):
+    """Dupin Cyclide Conic-Tangent + Deviatoric Cascade Optimizer (`CyclideAdam`) for GRT.
+
+    Generalizes flat-torus ("Donut") optimization to a **Dupin Cyclide** manifold where each 2D
+    rotation pair `p` forms an eccentric conic `(x / a_p)^2 + (y / b_p)^2 = 1` with semi-axes
+    `a_p = softplus(s_{2p})` and `b_p = softplus(s_{2p+1})`:
+      1. **Brianchon Conic Tangent Metric**: Preconditions angular updates by the inverse phase-dependent
+         conic tangent arc-length `(a_p^2 sin^2(theta_p) + b_p^2 cos^2(theta_p))^(-cyclide_exponent)`
+         normalized to unit mean across the stage,
+      2. **Deviatoric (Trace-Free) Cascade Twist**: Projects out coherent common-mode phase drift across
+         butterfly stages in `O(K * P)` time (`deviatoric_mix`), and
+      3. **Brianchon Rational Tangent Retraction**: Smoothly maps tangent steps onto the conic envelope
+         via `-2 * r_c * arctan(step / (2 * r_c))` without hard clipping discontinuities.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        cyclide_exponent: float = 0.5,
+        cyclide_min_metric_sq: float = 0.25,
+        cyclide_max_metric_sq: float = 4.0,
+        deviatoric_mix: float = 0.25,
+        brianchon_radius: float = 0.05,
+        max_cascade_stages: int = 256,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["cyclide_exponent"] = cyclide_exponent
+        self.defaults["cyclide_min_metric_sq"] = cyclide_min_metric_sq
+        self.defaults["cyclide_max_metric_sq"] = cyclide_max_metric_sq
+        self.defaults["deviatoric_mix"] = deviatoric_mix
+        self.defaults["brianchon_radius"] = brianchon_radius
+        self.defaults["max_cascade_stages"] = max_cascade_stages
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        cyclide_exp = self.defaults.get("cyclide_exponent", 0.5)
+        g_min_sq = self.defaults.get("cyclide_min_metric_sq", 0.25)
+        g_max_sq = self.defaults.get("cyclide_max_metric_sq", 4.0)
+        dev_mix = self.defaults.get("deviatoric_mix", 0.05)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+        limit = (max_ang / lr) if (max_ang is not None and lr > 0.0) else None
+        if sophia_rho is not None and sophia_rho > 0.0:
+            limit = min(limit, sophia_rho) if limit is not None else sophia_rho
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            sin_theta = torch.sin(p.data)
+            cos_theta = torch.cos(p.data)
+            g_conic_sq = _compute_cyclide_conic_metric_sq(
+                p, sin_theta=sin_theta, cos_theta=cos_theta
+            ).clamp(min=g_min_sq, max=g_max_sq)
+            inv_metric = torch.rsqrt(g_conic_sq) if cyclide_exp == 0.5 else g_conic_sq.pow(-cyclide_exp)
+            inv_metric = inv_metric / inv_metric.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            update = (m_eff * inv_metric) / pos_curv
+
+            if (
+                dev_mix > 0.0
+                and p.dim() in (2, 3)
+                and 1 < p.shape[0] <= max_cascade_stages
+            ):
+                dev = _project_cyclide_deviatoric(
+                    p, update, sin_theta=sin_theta, cos_theta=cos_theta
+                )
+                target_rms = update.square().mean().sqrt().clamp(min=1e-12)
+                dev_rms = dev.square().mean().sqrt().clamp(min=1e-12)
+                dev_scaled = dev * (target_rms / dev_rms)
+                update = (1.0 - dev_mix) * update + dev_mix * dev_scaled
+
+            if limit is not None:
+                update.clamp_(-limit, limit)
+
+            p.add_(update, alpha=-lr)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
 class ToroidalLion(Optimizer):
     """Sign-Momentum Toroidal Optimizer (`ToroidalLion` / `SignMomentumTorus`) for GRT.
 
@@ -1495,7 +1753,7 @@ def build_grt_optimizer(
     sophia_rho: float = 5.0,
     **kwargs,
 ) -> Optimizer:
-    """Construct a GRT toroidal optimizer (`HessianPairAdam`, `PairAdam`, `ToroidalMuon`, `PolarNaturalAdam`, `RotorAdam`, or `ToroidalLion`)."""
+    """Construct a GRT geometric optimizer (`HessianPairAdam`, `PairAdam`, `ToroidalMuon`, `PolarNaturalAdam`, `RotorAdam`, `CyclideAdam`, or `ToroidalLion`)."""
     param_groups = build_grt_param_groups(
         model,
         lr=lr,
@@ -1533,6 +1791,7 @@ def build_grt_optimizer(
         "toroidal_muon": ToroidalMuon,
         "polar_natural_adam": PolarNaturalAdam,
         "rotor_adam": RotorAdam,
+        "cyclide_adam": CyclideAdam,
     }
     if opt_key not in opt_map:
         raise ValueError(f"Unknown GRT optimizer_type={optimizer_type!r}. Expected one of { sorted([*opt_map, 'toroidal_lion']) }.")
@@ -1558,6 +1817,7 @@ def build_grt_optimizer(
 
 
 __all__ = [
+    "CyclideAdam",
     "HessianPairAdam",
     "PairAdam",
     "PolarNaturalAdam",

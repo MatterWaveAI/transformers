@@ -29,6 +29,7 @@ from transformers import (
     GRTVLForConditionalGeneration,
 )
 from transformers.models.grt import (
+    CyclideAdam,
     HessianPairAdam,
     PairAdam,
     PolarNaturalAdam,
@@ -249,11 +250,12 @@ class GRTOptimizationTest(unittest.TestCase):
         self.assertIsInstance(opt_pair, PairAdam)
 
     def test_toroidal_muon_polar_natural_rotor_and_lion_optimizers(self):
-        """ToroidalMuon, PolarNaturalAdam, RotorAdam, and ToroidalLion all decrease loss and wrap angles in [-pi, pi]."""
+        """ToroidalMuon, PolarNaturalAdam, RotorAdam, CyclideAdam, and ToroidalLion all decrease loss and wrap angles in [-pi, pi]."""
         for opt_type, opt_cls, lr in [
             ("toroidal_muon", ToroidalMuon, 5e-3),
             ("polar_natural_adam", PolarNaturalAdam, 5e-3),
             ("rotor_adam", RotorAdam, 5e-3),
+            ("cyclide_adam", CyclideAdam, 5e-3),
             ("toroidal_lion", ToroidalLion, 1e-3),
         ]:
             torch.manual_seed(7)

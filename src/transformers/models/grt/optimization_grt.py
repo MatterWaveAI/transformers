@@ -2884,6 +2884,267 @@ class RindlerAdam(HessianPairAdam):
             p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
 
 
+@torch.no_grad()
+def _apply_huygens_splay_torque(
+    angle_param: torch.Tensor,
+    raw_step: torch.Tensor,
+    splay_weight: float | torch.Tensor = 0.025,
+    splay_threshold: float = 0.35,
+    sin_theta: torch.Tensor | None = None,
+    cos_theta: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply zero-mean Huygens circular order parameter splay-state restoring torque across cascade stages `dim=0`.
+
+    Computes the classical Huygens circular synchronization order parameter
+    `R_p = |1/K sum_{k=0}^{K-1} exp(i * theta_{k,p})|` across cascade stages `k = 0, ..., K-1`.
+    When `R_p > splay_threshold`, applies a strictly zero-mean repulsive splay torque
+    `relu(R_p - splay_threshold) * sin(theta_{k,p} - Psi_p)` scaled by `raw_step.abs().mean(dim=0, keepdim=True)`
+    so over-synchronized cascade stages repel toward a balanced splay state without altering mean stage drift.
+    """
+    if angle_param.ndim < 2 or angle_param.shape[0] < 2:
+        return raw_step
+    theta_data = angle_param.data if isinstance(angle_param, torch.Tensor) else angle_param
+    s_th = sin_theta if sin_theta is not None else torch.sin(theta_data)
+    c_th = cos_theta if cos_theta is not None else torch.cos(theta_data)
+    mean_cos = c_th.mean(dim=0, keepdim=True)
+    mean_sin = s_th.mean(dim=0, keepdim=True)
+    r_sync = torch.sqrt(mean_cos.square() + mean_sin.square() + 1e-8)
+    sin_diff = (s_th * mean_cos - c_th * mean_sin) / r_sync.clamp(min=1e-6)
+    splay_torque = torch.relu(r_sync - splay_threshold) * sin_diff
+    splay_torque = splay_torque - splay_torque.mean(dim=0, keepdim=True)
+    step_scale = raw_step.abs().mean(dim=0, keepdim=True).clamp(min=1e-6)
+    return raw_step - splay_weight * step_scale * splay_torque
+
+
+_UNSET = object()
+
+
+class HuygensSymplecticAdam(SymplecticAdam):
+    """Two-Stage Huygens Synchronization -> Symplectic Non-Squeezing Curriculum Optimizer (`HuygensSymplecticAdam`) for GRT.
+
+    Unifies the two top-performing classical geometric mechanisms on `T*T^P` with a dynamic
+    step-and-momentum curriculum gate:
+      1. **Stage-1 Huygens Circular Order Parameter Splay Torque**: During high-gradient contrastive
+         alignment (`step <= splay_anneal_steps` and high normalized momentum energy `m_norm^2`),
+         computes the curriculum gate `gamma_step = 1 / (1 + (step / splay_anneal_steps)^2)` and
+         momentum activity factor `gamma_mom = m_norm^2 / (m_norm^2 + zpe_floor)`, applying the
+         strictly zero-mean Huygens circular order parameter (`R_p = |1/K sum_k exp(i * theta_{k,p})|`)
+         splay-state restoring torque with effective strength `splay_weight * gamma_step * (0.5 + 0.5 * gamma_mom)`
+         whenever `R_p > splay_threshold`.
+      2. **Stage-2 Gromov-Liouville Symplectic Non-Squeezing Floor & Helmholtz-Casimir Wave Cavity**:
+         As `step` advances past `splay_anneal_steps` and angular momentum settles toward `zpe_floor`,
+         the Huygens splay perturbation smoothly anneals away while the reciprocal symplectic stiffness floor
+         `c_symp = sqrt(c_base^2 + c_rms^2 * zpe_floor^2 / (m_norm^2 + zpe_floor))` and Helmholtz-Casimir
+         wave-cavity boundary Laplacian (`_apply_casimir_cavity_cascade`) govern fine-grained phase calibration.
+      3. **Cayley Isometric Rational Retraction**: Retracts tangent updates onto `SO(2)^P` via smooth rational
+         Cayley mapping bounded by `max_angle_step` (`max_angular_step`).
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        scale_weight_decay: float | None = None,
+        max_angle_step: float | None = None,
+        max_angular_step: Any = _UNSET,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        c1: float = 1.0,
+        c2: float = 1.0,
+        zpe_floor: float = 0.02,
+        casimir_coupling: float = 0.10,
+        splay_weight: float = 0.025,
+        splay_threshold: float = 0.35,
+        splay_anneal_steps: int | float = 250,
+        splay_stage2_ratio: float = 0.2,
+        deviatoric_mix: float = 0.15,
+        casimir_mix: float | None = None,
+        cyclide_min_metric_sq: float = 0.25,
+        cyclide_max_metric_sq: float = 4.0,
+        cayley_radius: float = 0.05,
+        max_cascade_stages: int = 256,
+        coupling_lr_mult: float = 1.0,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        if max_angle_step is not None:
+            eff_max_ang = max_angle_step
+        elif max_angular_step is not _UNSET:
+            eff_max_ang = max_angular_step
+        else:
+            eff_max_ang = 0.05
+        eff_casimir = casimir_mix if casimir_mix is not None else casimir_coupling
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=eff_max_ang,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            zpe_floor=zpe_floor,
+            deviatoric_mix=deviatoric_mix,
+            casimir_mix=eff_casimir,
+            cyclide_min_metric_sq=cyclide_min_metric_sq,
+            cyclide_max_metric_sq=cyclide_max_metric_sq,
+            cayley_radius=cayley_radius,
+            max_cascade_stages=max_cascade_stages,
+            coupling_lr_mult=coupling_lr_mult,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["scale_weight_decay"] = scale_weight_decay
+        self.defaults["max_angle_step"] = eff_max_ang if eff_max_ang is not None else 0.1
+        self.defaults["c1"] = c1
+        self.defaults["c2"] = c2
+        self.defaults["zpe_floor"] = zpe_floor
+        self.defaults["casimir_coupling"] = eff_casimir
+        self.defaults["splay_weight"] = splay_weight
+        self.defaults["splay_threshold"] = splay_threshold
+        self.defaults["splay_anneal_steps"] = float(splay_anneal_steps)
+        self.defaults["splay_stage2_ratio"] = float(splay_stage2_ratio)
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        zpe_floor = self.defaults.get("zpe_floor", 0.02)
+        dev_mix = self.defaults.get("deviatoric_mix", 0.15)
+        casimir_coupling = self.defaults.get("casimir_coupling", self.defaults.get("casimir_mix", 0.10))
+        splay_weight = self.defaults.get("splay_weight", 0.025)
+        splay_threshold = self.defaults.get("splay_threshold", 0.35)
+        splay_anneal_steps = max(float(self.defaults.get("splay_anneal_steps", 150.0)), 1.0)
+        g_min_sq = self.defaults.get("cyclide_min_metric_sq", 0.25)
+        g_max_sq = self.defaults.get("cyclide_max_metric_sq", 4.0)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+        max_step = max_ang if (max_ang is not None and max_ang > 0.0) else self.defaults.get("cayley_radius", 0.05)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            cum_step = getattr(p, "_huygens_cum_step", 0) + 1
+            p._huygens_cum_step = cum_step
+            if cum_step <= splay_anneal_steps:
+                step_ratio = float(cum_step) / splay_anneal_steps
+                gamma_step = 1.0 / (1.0 + step_ratio * step_ratio)
+            else:
+                s2_step = float(cum_step) - splay_anneal_steps
+                step_ratio = s2_step / splay_anneal_steps
+                s2_ratio = self.defaults.get("splay_stage2_ratio", 0.2)
+                gamma_step = s2_ratio / (1.0 + step_ratio * step_ratio)
+
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            sin_theta = torch.sin(p.data)
+            cos_theta = torch.cos(p.data)
+            r_conic_sq = _compute_cyclide_conic_metric_sq(
+                p, sin_theta=sin_theta, cos_theta=cos_theta
+            ).clamp(min=g_min_sq, max=g_max_sq)
+            r_conic_sq = r_conic_sq / r_conic_sq.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            c_raw = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            c_base = c_raw * r_conic_sq.sqrt()
+
+            c_rms_sq = c_base.square().mean().clamp(min=eps_h * eps_h)
+            m_norm_sq = m_hat.square() / c_rms_sq
+
+            if zpe_floor > 0.0:
+                c_symp = torch.sqrt(
+                    c_base.square() + c_rms_sq * (zpe_floor * zpe_floor) / (m_norm_sq + zpe_floor)
+                )
+            else:
+                c_symp = c_base
+
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            u = m_eff / c_symp
+
+            if p.dim() >= 2 and 1 < p.shape[0] <= max_cascade_stages:
+                if splay_weight > 0.0:
+                    m_stage_sq = m_norm_sq.mean(dim=0, keepdim=True)
+                    gamma_mom = m_stage_sq / (m_stage_sq + max(zpe_floor, 1e-8))
+                    gamma_splay = gamma_step * (0.5 + 0.5 * gamma_mom)
+                    u = _apply_huygens_splay_torque(
+                        p,
+                        u,
+                        splay_weight=splay_weight * gamma_splay,
+                        splay_threshold=splay_threshold,
+                        sin_theta=sin_theta,
+                        cos_theta=cos_theta,
+                    )
+                u_total = _apply_casimir_cavity_cascade(
+                    u, deviatoric_mix=dev_mix, casimir_mix=casimir_coupling
+                )
+            else:
+                u_total = u
+
+            delta_theta = -2.0 * max_step * torch.atan((lr * u_total) / (2.0 * max_step))
+            p.add_(delta_theta)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
 class ToroidalLion(Optimizer):
     """Sign-Momentum Toroidal Optimizer (`ToroidalLion` / `SignMomentumTorus`) for GRT.
 
@@ -3144,10 +3405,10 @@ def build_grt_optimizer(
     sophia_rho: float = 5.0,
     **kwargs,
 ) -> Optimizer:
-    """Construct a GRT geometric optimizer (`HessianPairAdam`, `PairAdam`, `ToroidalMuon`, `PolarNaturalAdam`, `RotorAdam`, `CyclideAdam`, `SymplecticAdam`, or `ToroidalLion`)."""
+    """Construct a GRT geometric optimizer (`HessianPairAdam`, `PairAdam`, `ToroidalMuon`, `PolarNaturalAdam`, `RotorAdam`, `CyclideAdam`, `SymplecticAdam`, `HuygensSymplecticAdam`, or `ToroidalLion`)."""
     opt_key = (optimizer_type or ("hessian_pair_adam" if hessian_mode else "pair_adam")).lower()
     eff_coupling_lr_mult = (
-        (1.0 if opt_key in ("symplectic_adam", "rindler_adam") else 3.0)
+        (1.0 if opt_key in ("symplectic_adam", "rindler_adam", "huygens_symplectic_adam") else 3.0)
         if coupling_lr_mult is None
         else coupling_lr_mult
     )
@@ -3193,6 +3454,7 @@ def build_grt_optimizer(
         "hannay_adam": HannayAdam,
         "poncelet_adam": PonceletAdam,
         "huygens_adam": HuygensAdam,
+        "huygens_symplectic_adam": HuygensSymplecticAdam,
         "beltrami_adam": BeltramiAdam,
         "rindler_adam": RindlerAdam,
     }
@@ -3229,6 +3491,7 @@ __all__ = [
     "HannayAdam",
     "HessianPairAdam",
     "HuygensAdam",
+    "HuygensSymplecticAdam",
     "PairAdam",
     "PolarNaturalAdam",
     "PonceletAdam",

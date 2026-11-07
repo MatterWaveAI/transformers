@@ -35,6 +35,7 @@ from transformers.models.grt import (
     HannayAdam,
     HessianPairAdam,
     HuygensAdam,
+    HuygensSymplecticAdam,
     PairAdam,
     PolarNaturalAdam,
     PonceletAdam,
@@ -268,6 +269,7 @@ class GRTOptimizationTest(unittest.TestCase):
             ("hannay_adam", HannayAdam, 5e-3),
             ("poncelet_adam", PonceletAdam, 5e-3),
             ("huygens_adam", HuygensAdam, 5e-3),
+            ("huygens_symplectic_adam", HuygensSymplecticAdam, 5e-3),
             ("beltrami_adam", BeltramiAdam, 5e-3),
             ("rindler_adam", RindlerAdam, 5e-3),
             ("toroidal_lion", ToroidalLion, 1e-3),
@@ -332,6 +334,52 @@ class GRTOptimizationTest(unittest.TestCase):
 
         loss_final = model(input_ids=input_ids, labels=input_ids).loss.item()
         self.assertLess(loss_final, loss0)
+        for p in model.parameters():
+            self.assertTrue(torch.isfinite(p).all())
+
+    def test_huygens_symplectic_adam_curriculum_and_cayley_bound(self):
+        """HuygensSymplecticAdam applies zero-mean splay curriculum annealing, symplectic floor, and Cayley step bound."""
+        from transformers.models.grt.optimization_grt import _apply_huygens_splay_torque
+
+        torch.manual_seed(17)
+        # Bunched cascade stages (R_p > splay_threshold)
+        theta_bunched = torch.tensor([[0.10, -0.20], [0.15, -0.15], [0.05, -0.25], [0.12, -0.18]], dtype=torch.float32)
+        raw_step = torch.tensor([[1.0, -0.5], [0.8, -0.4], [1.2, -0.6], [1.0, -0.5]], dtype=torch.float32)
+        u_splay = _apply_huygens_splay_torque(theta_bunched, raw_step, splay_weight=0.1, splay_threshold=0.35)
+        self.assertEqual(u_splay.shape, raw_step.shape)
+        self.assertTrue(torch.isfinite(u_splay).all())
+        # Zero-mean across dim=0 preserves stage mean update
+        self.assertTrue(torch.allclose(u_splay.mean(dim=0), raw_step.mean(dim=0), atol=1e-6))
+        self.assertGreater((u_splay - raw_step).abs().max().item(), 0.0)
+
+        cfg = self._tiny_config(n_q_rotations=4, ffn_n_rotations=4)
+        model = GRTForCausalLM(cfg)
+        optimizer = build_grt_optimizer(
+            model,
+            lr=5e-3,
+            weight_decay=0.01,
+            optimizer_type="huygens_symplectic_adam",
+            max_angle_step=0.08,
+            zpe_floor=0.015,
+            casimir_coupling=0.08,
+            splay_weight=0.05,
+            splay_anneal_steps=250,
+        )
+        self.assertIsInstance(optimizer, HuygensSymplecticAdam)
+
+        q_angles = model.model.blocks[0].attention.q_angles
+        q_before = q_angles.detach().clone()
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 10))
+        loss0 = model(input_ids=input_ids, labels=input_ids).loss.item()
+        for _ in range(4):
+            optimizer.zero_grad()
+            out = model(input_ids=input_ids, labels=input_ids)
+            out.loss.backward()
+            optimizer.step()
+
+        loss_final = model(input_ids=input_ids, labels=input_ids).loss.item()
+        self.assertLess(loss_final, loss0)
+        self.assertGreater((q_angles.detach() - q_before).abs().max().item(), 0.0)
         for p in model.parameters():
             self.assertTrue(torch.isfinite(p).all())
 

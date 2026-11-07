@@ -29,11 +29,18 @@ from transformers import (
     GRTVLForConditionalGeneration,
 )
 from transformers.models.grt import (
+    BeltramiAdam,
     CyclideAdam,
+    GyricAdam,
+    HannayAdam,
     HessianPairAdam,
+    HuygensAdam,
     PairAdam,
     PolarNaturalAdam,
+    PonceletAdam,
+    RindlerAdam,
     RotorAdam,
+    SymplecticAdam,
     ToroidalLion,
     ToroidalMuon,
     build_grt_optimizer,
@@ -250,12 +257,19 @@ class GRTOptimizationTest(unittest.TestCase):
         self.assertIsInstance(opt_pair, PairAdam)
 
     def test_toroidal_muon_polar_natural_rotor_and_lion_optimizers(self):
-        """ToroidalMuon, PolarNaturalAdam, RotorAdam, CyclideAdam, and ToroidalLion all decrease loss and wrap angles in [-pi, pi]."""
+        """All GRT geometric optimizers decrease loss and wrap angles in [-pi, pi]."""
         for opt_type, opt_cls, lr in [
             ("toroidal_muon", ToroidalMuon, 5e-3),
             ("polar_natural_adam", PolarNaturalAdam, 5e-3),
             ("rotor_adam", RotorAdam, 5e-3),
             ("cyclide_adam", CyclideAdam, 5e-3),
+            ("symplectic_adam", SymplecticAdam, 5e-3),
+            ("gyric_adam", GyricAdam, 5e-3),
+            ("hannay_adam", HannayAdam, 5e-3),
+            ("poncelet_adam", PonceletAdam, 5e-3),
+            ("huygens_adam", HuygensAdam, 5e-3),
+            ("beltrami_adam", BeltramiAdam, 5e-3),
+            ("rindler_adam", RindlerAdam, 5e-3),
             ("toroidal_lion", ToroidalLion, 1e-3),
         ]:
             torch.manual_seed(7)
@@ -279,6 +293,47 @@ class GRTOptimizationTest(unittest.TestCase):
             for name, p in model.named_parameters():
                 if "angle" in name:
                     self.assertLessEqual(p.data.abs().max().item(), math.pi + 1e-5, f"{opt_type} unwrapped {name}")
+
+    def test_symplectic_adam_non_squeezing_and_cavity_step(self):
+        """SymplecticAdam applies the symplectic non-squeezing floor, Casimir cavity smoothing, and Cayley retraction while decreasing loss."""
+        from transformers.models.grt.optimization_grt import _apply_casimir_cavity_cascade
+
+        torch.manual_seed(11)
+        u = torch.tensor([[1.0, -1.0], [3.0, 0.0], [-1.0, 4.0], [1.0, -3.0]], dtype=torch.float32)
+        u_cav = _apply_casimir_cavity_cascade(u, deviatoric_mix=0.15, casimir_mix=0.10)
+        self.assertEqual(u_cav.shape, u.shape)
+        self.assertTrue(torch.isfinite(u_cav).all())
+        # Deviatoric projection shrinks the stage-mean magnitude by (1 - deviatoric_mix)
+        self.assertTrue(
+            torch.allclose(u_cav.mean(dim=0), (1.0 - 0.15) * u.mean(dim=0), atol=1e-6),
+            f"Expected stage mean {(1.0 - 0.15) * u.mean(dim=0)}, got {u_cav.mean(dim=0)}",
+        )
+
+        cfg = self._tiny_config(n_q_rotations=4, ffn_n_rotations=4)
+        model = GRTForCausalLM(cfg)
+        optimizer = build_grt_optimizer(
+            model,
+            lr=5e-3,
+            weight_decay=0.01,
+            optimizer_type="symplectic_adam",
+            zpe_floor=0.02,
+            deviatoric_mix=0.15,
+            casimir_mix=0.10,
+        )
+        self.assertIsInstance(optimizer, SymplecticAdam)
+
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 10))
+        loss0 = model(input_ids=input_ids, labels=input_ids).loss.item()
+        for _ in range(4):
+            optimizer.zero_grad()
+            out = model(input_ids=input_ids, labels=input_ids)
+            out.loss.backward()
+            optimizer.step()
+
+        loss_final = model(input_ids=input_ids, labels=input_ids).loss.item()
+        self.assertLess(loss_final, loss0)
+        for p in model.parameters():
+            self.assertTrue(torch.isfinite(p).all())
 
 
 if __name__ == "__main__":

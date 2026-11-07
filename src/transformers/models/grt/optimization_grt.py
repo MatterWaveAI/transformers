@@ -1493,6 +1493,1397 @@ class CyclideAdam(HessianPairAdam):
             p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
 
 
+@torch.no_grad()
+def _apply_casimir_cavity_cascade(
+    u: torch.Tensor,
+    deviatoric_mix: float = 0.15,
+    casimir_mix: float = 0.10,
+) -> torch.Tensor:
+    """Apply trace-free deviatoric projection and Helmholtz-Casimir cavity boundary coupling along `dim=0`.
+
+    On multi-stage rotation cascades (`u.dim() >= 2` and `u.shape[0] > 1`, shape `[K, ...]`), combines:
+      1. **Deviatoric (trace-free) cascade projection**: `u_dev = u - mean(u, dim=0, keepdim=True)` blended
+         with weight `deviatoric_mix` to remove coherent common-mode phase drift across cascade stages, and
+      2. **Helmholtz-Casimir wave-cavity boundary coupling**: for `K >= 3`, computes the discrete 1D cavity
+         Laplacian along stage axis `0` with homogeneous Neumann boundary conditions at plates `k = 0` and
+         `k = K - 1` (`u_pad = cat([u[:1], u, u[-1:]], dim=0)`, `lap = 0.5 * (u_pad[:-2] + u_pad[2:]) - u`)
+         and adds `casimir_mix * lap` to equalize inter-stage phase pressure across adjacent plates.
+    """
+    if u.dim() < 2 or u.shape[0] <= 1:
+        return u
+    u_total = u
+    if deviatoric_mix != 0.0:
+        u_dev = u - u.mean(dim=0, keepdim=True)
+        u_total = (1.0 - deviatoric_mix) * u_total + deviatoric_mix * u_dev
+    if casimir_mix != 0.0 and u.shape[0] >= 3:
+        u_pad = torch.cat([u[:1], u, u[-1:]], dim=0)
+        lap = 0.5 * (u_pad[:-2] + u_pad[2:]) - u
+        u_total = u_total + casimir_mix * lap
+    return u_total
+
+
+class SymplecticAdam(HessianPairAdam):
+    """Symplectic Non-Squeezing + Casimir Cavity Cascade Optimizer (`SymplecticAdam`) for GRT.
+
+    Operates on the cotangent bundle of the Dupin Cyclide / Torus (`T*T^P`) using strictly classical
+    differential, symplectic, and wave-cavity geometry:
+      1. **Brianchon Conic Tangent Arc-Length Metric (`r_conic^2`)**: Scales intrinsic toroidal curvature by
+         the phase-dependent conic tangent arc-length `sqrt(a_p^2 sin^2(theta_p) + b_p^2 cos^2(theta_p))` of
+         the coupled planar pair (falling back to `1.0` when uncoupled).
+      2. **Gromov-Liouville Symplectic Non-Squeezing Stiffness Floor**: Enforces an irreducible minimum
+         phase-space area (`Delta_theta * Delta_p >= zpe_floor`) so that as bias-corrected angular momentum
+         `m_hat` decays toward zero in late fine-tuning, the conjugate symplectic stiffness rises reciprocally:
+         `c_symp = sqrt(c_base^2 + c_rms^2 * zpe_floor^2 / ((m_hat / c_rms)^2 + zpe_floor))`
+         preventing phase-space collapse into sharp overfit minima while vanishing during active high-momentum
+         alignment.
+      3. **Helmholtz-Casimir Cavity Boundary Coupling + Cayley Rational Retraction**: Applies trace-free
+         deviatoric cascade projection (`deviatoric_mix`) and discrete Neumann wave-cavity Laplacian smoothing
+         (`casimir_mix`) between adjacent cascade stages `(k-1, k, k+1)` along `dim=0`, followed by smooth
+         rational Cayley retraction `delta_theta = -2 * max_step * arctan((lr * u_total) / (2 * max_step))`
+         on `SO(2)^P`.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        zpe_floor: float = 0.02,
+        deviatoric_mix: float = 0.15,
+        casimir_mix: float = 0.10,
+        cyclide_min_metric_sq: float = 0.25,
+        cyclide_max_metric_sq: float = 4.0,
+        cayley_radius: float = 0.05,
+        max_cascade_stages: int = 256,
+        coupling_lr_mult: float = 1.0,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["zpe_floor"] = zpe_floor
+        self.defaults["deviatoric_mix"] = deviatoric_mix
+        self.defaults["casimir_mix"] = casimir_mix
+        self.defaults["cyclide_min_metric_sq"] = cyclide_min_metric_sq
+        self.defaults["cyclide_max_metric_sq"] = cyclide_max_metric_sq
+        self.defaults["cayley_radius"] = cayley_radius
+        self.defaults["max_cascade_stages"] = max_cascade_stages
+        self.defaults["coupling_lr_mult"] = coupling_lr_mult
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        zpe_floor = self.defaults.get("zpe_floor", 0.02)
+        dev_mix = self.defaults.get("deviatoric_mix", 0.15)
+        casimir_mix = self.defaults.get("casimir_mix", 0.10)
+        g_min_sq = self.defaults.get("cyclide_min_metric_sq", 0.25)
+        g_max_sq = self.defaults.get("cyclide_max_metric_sq", 4.0)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+        max_step = max_ang if (max_ang is not None and max_ang > 0.0) else self.defaults.get("cayley_radius", 0.05)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            sin_theta = torch.sin(p.data)
+            cos_theta = torch.cos(p.data)
+            r_conic_sq = _compute_cyclide_conic_metric_sq(
+                p, sin_theta=sin_theta, cos_theta=cos_theta
+            ).clamp(min=g_min_sq, max=g_max_sq)
+            r_conic_sq = r_conic_sq / r_conic_sq.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            c_raw = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            c_base = c_raw * r_conic_sq.sqrt()
+
+            if zpe_floor > 0.0:
+                c_rms_sq = c_base.square().mean().clamp(min=eps_h * eps_h)
+                m_norm_sq = m_hat.square() / c_rms_sq
+                c_symp = torch.sqrt(
+                    c_base.square() + c_rms_sq * (zpe_floor * zpe_floor) / (m_norm_sq + zpe_floor)
+                )
+            else:
+                c_symp = c_base
+
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            u = m_eff / c_symp
+
+            if p.dim() >= 2 and 1 < p.shape[0] <= max_cascade_stages:
+                u_total = _apply_casimir_cavity_cascade(
+                    u, deviatoric_mix=dev_mix, casimir_mix=casimir_mix
+                )
+            else:
+                u_total = u
+
+            delta_theta = -2.0 * max_step * torch.atan((lr * u_total) / (2.0 * max_step))
+            p.add_(delta_theta)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+@torch.no_grad()
+def _compute_hannay_holonomy_and_polar_metric(
+    angle_param: torch.Tensor,
+    paired_raw_scale: torch.Tensor | None = None,
+    is_log_magnitude: bool = False,
+    group_scale_partners: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute isotropic polar pair metric `r_iso^2` and classical Hannay adiabatic holonomy drift `omega_hannay`.
+
+    For each 2D Givens pair `p` with positive semi-axes `r1 = softplus(s_{2p})` and `r2 = softplus(s_{2p+1})`
+    and radial gradient velocities `dr_i = -sigmoid(s_i) * grad_{s_i}`, the classical Hannay adiabatic
+    connection form on the deforming ellipse `(x / r1)^2 + (y / r2)^2 = 1` is:
+        `omega_hannay = (r1 * dr2 - r2 * dr1) / (r1^2 + r2^2 + eps)`
+    Subtracting `hannay_weight * omega_hannay` from the angular update cancels spurious phase drift
+    induced by anisotropic scale deformations (`r1 != r2`).
+    """
+    if paired_raw_scale is None:
+        paired_raw_scale, is_log_magnitude = _resolve_scale_partner(angle_param, group_scale_partners)
+    if paired_raw_scale is None:
+        return torch.ones_like(angle_param), torch.zeros_like(angle_param)
+
+    work_dtype = torch.float64 if paired_raw_scale.dtype == torch.float64 else torch.float32
+    if paired_raw_scale.numel() == 2 * angle_param.numel():
+        s_raw = paired_raw_scale.detach().to(dtype=work_dtype)
+        s_act = F.softplus(s_raw)
+        s_pairs = s_act.reshape(*angle_param.shape, 2)
+        r1 = s_pairs[..., 0]
+        r2 = s_pairs[..., 1]
+        r_sum_sq = r1.square() + r2.square()
+        r_iso_sq = (0.5 * r_sum_sq).to(dtype=angle_param.dtype)
+
+        if paired_raw_scale.grad is not None:
+            s_grad = paired_raw_scale.grad.detach().to(dtype=work_dtype)
+            ds = (-s_grad) * torch.sigmoid(s_raw)
+            ds_pairs = ds.reshape(*angle_param.shape, 2)
+            dr1 = ds_pairs[..., 0]
+            dr2 = ds_pairs[..., 1]
+            omega = ((r1 * dr2 - r2 * dr1) / (r_sum_sq + 1e-6)).clamp(-1.0, 1.0)
+            return r_iso_sq, omega.to(dtype=angle_param.dtype)
+        return r_iso_sq, torch.zeros_like(angle_param)
+
+    if (
+        paired_raw_scale.dim() == angle_param.dim() + 1
+        and paired_raw_scale.shape[1:-1] == angle_param.shape[:-1]
+        and paired_raw_scale.shape[-1] == 2 * angle_param.shape[-1]
+    ):
+        s_raw = paired_raw_scale.detach().to(dtype=work_dtype)
+        s_act = F.softplus(s_raw)
+        s_pairs = s_act.reshape(paired_raw_scale.shape[0], *angle_param.shape, 2)
+        r1 = s_pairs[..., 0]
+        r2 = s_pairs[..., 1]
+        r_sum_sq = r1.square() + r2.square()
+        r_iso_sq = (0.5 * r_sum_sq.mean(dim=0)).to(dtype=angle_param.dtype)
+
+        if paired_raw_scale.grad is not None:
+            s_grad = paired_raw_scale.grad.detach().to(dtype=work_dtype)
+            ds = (-s_grad) * torch.sigmoid(s_raw)
+            ds_pairs = ds.reshape(paired_raw_scale.shape[0], *angle_param.shape, 2)
+            dr1 = ds_pairs[..., 0]
+            dr2 = ds_pairs[..., 1]
+            omega = ((r1 * dr2 - r2 * dr1) / (r_sum_sq + 1e-6)).mean(dim=0).clamp(-1.0, 1.0)
+            return r_iso_sq, omega.to(dtype=angle_param.dtype)
+        return r_iso_sq, torch.zeros_like(angle_param)
+
+    r_iso_sq = _compute_polar_pair_radius_sq(
+        angle_param,
+        paired_raw_scale=paired_raw_scale,
+        is_log_magnitude=is_log_magnitude,
+        group_scale_partners=group_scale_partners,
+    )
+    return r_iso_sq, torch.zeros_like(angle_param)
+
+
+class HannayAdam(HessianPairAdam):
+    """Classical Adiabatic Holonomy / Levi-Civita Scale-Angle Connection Optimizer (`HannayAdam`) for GRT.
+
+    Combines:
+      1. **Isotropic Polar Natural Metric (`PolarNaturalAdam`)**: Preconditions angular updates by the
+         inverse mean-normalized pair radius `r_iso^(-2 * polar_exponent)` where `r_iso^2 = 0.5 * (r1^2 + r2^2)`,
+      2. **Classical Hannay Holonomy Connection**: Subtracts the adiabatic scale-deformation angular drift
+         `omega_hannay = (r1 * dr2 - r2 * dr1) / (r1^2 + r2^2 + eps)` induced by anisotropic radial scale
+         updates `(dr1, dr2)` so that changing scale aspect ratios `r2 / r1` does not corrupt learned phases, and
+      3. **Smooth Cayley Rational Retraction**: Maps tangent steps onto `SO(2)^P` via
+         `-2 * r_c * arctan((lr * u_corr) / (2 * r_c))`.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        polar_exponent: float = 0.5,
+        polar_min_radius_sq: float = 0.25,
+        polar_max_radius_sq: float = 4.0,
+        hannay_weight: float = 0.10,
+        cayley_radius: float = 0.05,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["polar_exponent"] = polar_exponent
+        self.defaults["polar_min_radius_sq"] = polar_min_radius_sq
+        self.defaults["polar_max_radius_sq"] = polar_max_radius_sq
+        self.defaults["hannay_weight"] = hannay_weight
+        self.defaults["cayley_radius"] = cayley_radius
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        polar_exp = self.defaults.get("polar_exponent", 0.5)
+        r_min_sq = self.defaults.get("polar_min_radius_sq", 0.25)
+        r_max_sq = self.defaults.get("polar_max_radius_sq", 4.0)
+        hannay_weight = self.defaults.get("hannay_weight", 0.10)
+        r_c = max_ang if (max_ang is not None and max_ang > 0.0) else self.defaults.get("cayley_radius", 0.05)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            r_iso_sq, omega_hannay = _compute_hannay_holonomy_and_polar_metric(p)
+            r_norm_sq = (r_iso_sq / r_iso_sq.mean().clamp(min=1e-6)).clamp(min=r_min_sq, max=r_max_sq)
+            inv_metric = torch.rsqrt(r_norm_sq) if polar_exp == 0.5 else r_norm_sq.pow(-polar_exp)
+            inv_metric = inv_metric / inv_metric.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            u = (m_eff / pos_curv) * inv_metric
+            if hannay_weight != 0.0:
+                u = u - hannay_weight * omega_hannay
+
+            delta_theta = -2.0 * r_c * torch.atan((lr * u) / (2.0 * r_c))
+            p.add_(delta_theta)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+@torch.no_grad()
+def _compute_poncelet_confocal_metric(
+    angle_param: torch.Tensor,
+    sin_theta: torch.Tensor,
+    cos_theta: torch.Tensor,
+    paired_raw_scale: torch.Tensor | None = None,
+    is_log_magnitude: bool = False,
+    group_scale_partners: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute Poncelet confocal-eccentricity blended metric `g_poncelet_sq` and focal eccentricity `ecc_sq`.
+
+    Blends the isotropic polar metric `r_iso^2 = 0.5 * (r1^2 + r2^2)` (`PolarNaturalAdam`) and the
+    Brianchon conic tangent metric `g_conic^2 = r1^2 sin^2(theta) + r2^2 cos^2(theta)` (`CyclideAdam`)
+    according to the local confocal eccentricity `ecc_sq = |r1^2 - r2^2| / (r1^2 + r2^2 + eps)`.
+    """
+    if paired_raw_scale is None:
+        paired_raw_scale, is_log_magnitude = _resolve_scale_partner(angle_param, group_scale_partners)
+    if paired_raw_scale is None:
+        return torch.ones_like(angle_param), torch.zeros_like(angle_param)
+
+    work_dtype = torch.float64 if paired_raw_scale.dtype == torch.float64 else torch.float32
+    if paired_raw_scale.numel() == 2 * angle_param.numel():
+        s_raw = paired_raw_scale.detach().to(dtype=work_dtype)
+        s_act = F.softplus(s_raw)
+        s_pairs = s_act.reshape(*angle_param.shape, 2)
+        r1_sq = s_pairs[..., 0].square()
+        r2_sq = s_pairs[..., 1].square()
+        r_sum_sq = r1_sq + r2_sq
+        r_iso_sq = 0.5 * r_sum_sq
+        ecc_sq = ((r1_sq - r2_sq).abs() / (r_sum_sq + 1e-6)).clamp(0.0, 1.0)
+        sin_sq = sin_theta.to(dtype=work_dtype).square()
+        cos_sq = cos_theta.to(dtype=work_dtype).square()
+        g_conic_sq = r1_sq * sin_sq + r2_sq * cos_sq
+        g_poncelet_sq = (1.0 - ecc_sq) * r_iso_sq + ecc_sq * g_conic_sq
+        return g_poncelet_sq.to(dtype=angle_param.dtype), ecc_sq.to(dtype=angle_param.dtype)
+
+    if (
+        paired_raw_scale.dim() == angle_param.dim() + 1
+        and paired_raw_scale.shape[1:-1] == angle_param.shape[:-1]
+        and paired_raw_scale.shape[-1] == 2 * angle_param.shape[-1]
+    ):
+        s_raw = paired_raw_scale.detach().to(dtype=work_dtype)
+        s_act = F.softplus(s_raw)
+        s_pairs = s_act.reshape(paired_raw_scale.shape[0], *angle_param.shape, 2)
+        r1_sq = s_pairs[..., 0].square().mean(dim=0)
+        r2_sq = s_pairs[..., 1].square().mean(dim=0)
+        r_sum_sq = r1_sq + r2_sq
+        r_iso_sq = 0.5 * r_sum_sq
+        ecc_sq = ((r1_sq - r2_sq).abs() / (r_sum_sq + 1e-6)).clamp(0.0, 1.0)
+        sin_sq = sin_theta.to(dtype=work_dtype).square()
+        cos_sq = cos_theta.to(dtype=work_dtype).square()
+        g_conic_sq = r1_sq * sin_sq + r2_sq * cos_sq
+        g_poncelet_sq = (1.0 - ecc_sq) * r_iso_sq + ecc_sq * g_conic_sq
+        return g_poncelet_sq.to(dtype=angle_param.dtype), ecc_sq.to(dtype=angle_param.dtype)
+
+    r_iso_sq = _compute_polar_pair_radius_sq(
+        angle_param,
+        paired_raw_scale=paired_raw_scale,
+        is_log_magnitude=is_log_magnitude,
+        group_scale_partners=group_scale_partners,
+    )
+    return r_iso_sq, torch.zeros_like(angle_param)
+
+
+class PonceletAdam(HessianPairAdam):
+    """Classical Poncelet Porism / Confocal Elliptic Closure Optimizer (`PonceletAdam`) for GRT.
+
+    Unifies `PolarNaturalAdam` (isotropic polar metric) and `CyclideAdam` (Brianchon conic tangent metric)
+    via Poncelet's closure theorem on confocal ellipses (`c_p^2 = |r1^2 - r2^2|`):
+      1. **Confocal Eccentricity Metric Blending**: Smoothly interpolates between the isotropic polar metric
+         `r_iso^2 = 0.5 * (r1^2 + r2^2)` when a pair is nearly circular (`ecc_sq -> 0`) and the Brianchon
+         conic tangent metric `g_conic^2 = r1^2 sin^2(theta) + r2^2 cos^2(theta)` when eccentric (`ecc_sq -> 1`),
+      2. **Eccentricity-Gated Deviatoric Cascade Twist**: Scales the trace-free deviatoric projection across
+         cascade stages by `dev_mix * (0.5 + 0.5 * ecc_sq.mean())`, and
+      3. **Smooth Cayley Rational Retraction**: Maps tangent updates smoothly onto `SO(2)^P`.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        poncelet_min_metric_sq: float = 0.25,
+        poncelet_max_metric_sq: float = 4.0,
+        deviatoric_mix: float = 0.08,
+        cayley_radius: float = 0.05,
+        max_cascade_stages: int = 256,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["poncelet_min_metric_sq"] = poncelet_min_metric_sq
+        self.defaults["poncelet_max_metric_sq"] = poncelet_max_metric_sq
+        self.defaults["deviatoric_mix"] = deviatoric_mix
+        self.defaults["cayley_radius"] = cayley_radius
+        self.defaults["max_cascade_stages"] = max_cascade_stages
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        g_min_sq = self.defaults.get("poncelet_min_metric_sq", 0.25)
+        g_max_sq = self.defaults.get("poncelet_max_metric_sq", 4.0)
+        dev_mix = self.defaults.get("deviatoric_mix", 0.08)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+        r_c = max_ang if (max_ang is not None and max_ang > 0.0) else self.defaults.get("cayley_radius", 0.05)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            sin_theta = torch.sin(p.data)
+            cos_theta = torch.cos(p.data)
+            g_poncelet_sq, ecc_sq = _compute_poncelet_confocal_metric(p, sin_theta=sin_theta, cos_theta=cos_theta)
+            g_norm_sq = (g_poncelet_sq / g_poncelet_sq.mean().clamp(min=1e-6)).clamp(min=g_min_sq, max=g_max_sq)
+            inv_metric = torch.rsqrt(g_norm_sq)
+            inv_metric = inv_metric / inv_metric.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            u = (m_eff / pos_curv) * inv_metric
+
+            if (
+                dev_mix > 0.0
+                and p.dim() in (2, 3)
+                and 1 < p.shape[0] <= max_cascade_stages
+            ):
+                dev = _project_cyclide_deviatoric(p, u, sin_theta=sin_theta, cos_theta=cos_theta)
+                target_rms = u.square().mean().sqrt().clamp(min=1e-12)
+                dev_rms = dev.square().mean().sqrt().clamp(min=1e-12)
+                dev_scaled = dev * (target_rms / dev_rms)
+                eff_mix = dev_mix * (0.5 + 0.5 * float(ecc_sq.mean()))
+                u = (1.0 - eff_mix) * u + eff_mix * dev_scaled
+
+            delta_theta = -2.0 * r_c * torch.atan((lr * u) / (2.0 * r_c))
+            p.add_(delta_theta)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+class HuygensAdam(HessianPairAdam):
+    """Classical Huygens Synchronization / Circular Splay-State Optimizer (`HuygensAdam`) for GRT.
+
+    Monitors the classical Huygens-Kuramoto circular order parameter `R_p = |1/K sum_k exp(i * theta_{k,p})|`
+    across cascade stages `k = 0, ..., K-1`:
+      1. **Conic / Polar Metric Preconditioning**: Preconditions updates by the inverse conic tangent arc-length,
+      2. **Huygens Splay-State Anti-Synchronization Torque**: When `R_p > splay_threshold` (cascade stages are
+         bunching toward identical angles and losing butterfly diversity), applies a repulsive restoring torque
+         `splay_torque = relu(R_p - splay_threshold) * sin(theta_{k,p} - Psi_p)` that pushes bunched stages
+         apart toward a balanced splay state (`R_p <= splay_threshold`), and
+      3. **Smooth Cayley Rational Retraction**: Maps tangent updates smoothly onto `SO(2)^P`.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        splay_threshold: float = 0.35,
+        splay_weight: float = 0.15,
+        cyclide_min_metric_sq: float = 0.25,
+        cyclide_max_metric_sq: float = 4.0,
+        cayley_radius: float = 0.05,
+        max_cascade_stages: int = 256,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["splay_threshold"] = splay_threshold
+        self.defaults["splay_weight"] = splay_weight
+        self.defaults["cyclide_min_metric_sq"] = cyclide_min_metric_sq
+        self.defaults["cyclide_max_metric_sq"] = cyclide_max_metric_sq
+        self.defaults["cayley_radius"] = cayley_radius
+        self.defaults["max_cascade_stages"] = max_cascade_stages
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        splay_threshold = self.defaults.get("splay_threshold", 0.35)
+        splay_weight = self.defaults.get("splay_weight", 0.15)
+        g_min_sq = self.defaults.get("cyclide_min_metric_sq", 0.25)
+        g_max_sq = self.defaults.get("cyclide_max_metric_sq", 4.0)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+        r_c = max_ang if (max_ang is not None and max_ang > 0.0) else self.defaults.get("cayley_radius", 0.05)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            sin_theta = torch.sin(p.data)
+            cos_theta = torch.cos(p.data)
+            g_conic_sq = _compute_cyclide_conic_metric_sq(
+                p, sin_theta=sin_theta, cos_theta=cos_theta
+            ).clamp(min=g_min_sq, max=g_max_sq)
+            inv_metric = torch.rsqrt(g_conic_sq)
+            inv_metric = inv_metric / inv_metric.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            u = (m_eff / pos_curv) * inv_metric
+
+            if (
+                splay_weight > 0.0
+                and p.dim() >= 2
+                and 1 < p.shape[0] <= max_cascade_stages
+            ):
+                mean_cos = cos_theta.mean(dim=0, keepdim=True)
+                mean_sin = sin_theta.mean(dim=0, keepdim=True)
+                r_sync = torch.sqrt(mean_cos.square() + mean_sin.square() + 1e-8)
+                sin_diff = (sin_theta * mean_cos - cos_theta * mean_sin) / r_sync.clamp(min=1e-6)
+                splay_torque = torch.relu(r_sync - splay_threshold) * sin_diff
+                u = u - splay_weight * splay_torque
+
+            delta_theta = -2.0 * r_c * torch.atan((lr * u) / (2.0 * r_c))
+            p.add_(delta_theta)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+class BeltramiAdam(HessianPairAdam):
+    """Classical Beltrami Force-Free Helicity Vortex Optimizer (`BeltramiAdam`) for GRT.
+
+    Models multi-stage butterfly rotation cascades as a classical Beltrami vortex flow (`curl(u) = lambda * u`)
+    where velocity `u` and discrete stage vorticity `omega_k = wrap(theta_{k+1} - theta_{k-1}) / 2` align so
+    nonlinear inter-stage shear turbulence vanishes:
+      1. **Conic / Polar Metric Preconditioning**: Preconditions updates by the inverse conic tangent arc-length,
+      2. **Beltrami Helicity Alignment**: Projects the deviatoric stage update `u_dev = u - mean(u, dim=0)`
+         partially onto the RMS-matched discrete stage vorticity profile weighted by their local helicity
+         cosine alignment `tanh(5 * cos(u_dev, vorticity))`, and
+      3. **Smooth Cayley Rational Retraction**: Maps tangent updates smoothly onto `SO(2)^P`.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        beltrami_mix: float = 0.08,
+        cyclide_min_metric_sq: float = 0.25,
+        cyclide_max_metric_sq: float = 4.0,
+        cayley_radius: float = 0.05,
+        max_cascade_stages: int = 256,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["beltrami_mix"] = beltrami_mix
+        self.defaults["cyclide_min_metric_sq"] = cyclide_min_metric_sq
+        self.defaults["cyclide_max_metric_sq"] = cyclide_max_metric_sq
+        self.defaults["cayley_radius"] = cayley_radius
+        self.defaults["max_cascade_stages"] = max_cascade_stages
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        beltrami_mix = self.defaults.get("beltrami_mix", 0.08)
+        g_min_sq = self.defaults.get("cyclide_min_metric_sq", 0.25)
+        g_max_sq = self.defaults.get("cyclide_max_metric_sq", 4.0)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+        r_c = max_ang if (max_ang is not None and max_ang > 0.0) else self.defaults.get("cayley_radius", 0.05)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            sin_theta = torch.sin(p.data)
+            cos_theta = torch.cos(p.data)
+            g_conic_sq = _compute_cyclide_conic_metric_sq(
+                p, sin_theta=sin_theta, cos_theta=cos_theta
+            ).clamp(min=g_min_sq, max=g_max_sq)
+            inv_metric = torch.rsqrt(g_conic_sq)
+            inv_metric = inv_metric / inv_metric.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            u = (m_eff / pos_curv) * inv_metric
+
+            if (
+                beltrami_mix > 0.0
+                and p.dim() >= 2
+                and 3 <= p.shape[0] <= max_cascade_stages
+            ):
+                theta_pad = torch.cat([p.data[:1], p.data, p.data[-1:]], dim=0)
+                vorticity = 0.5 * ((theta_pad[2:] - theta_pad[:-2] + math.pi) % (2.0 * math.pi) - math.pi)
+                u_dev = u - u.mean(dim=0, keepdim=True)
+                u_dev_rms = u_dev.square().mean(dim=0, keepdim=True).sqrt().clamp(min=1e-6)
+                vort_col_rms = vorticity.square().mean(dim=0, keepdim=True).sqrt().clamp(min=1e-6)
+                cos_align = (u_dev * vorticity).mean(dim=0, keepdim=True) / (u_dev_rms * vort_col_rms)
+                helicity_sign = torch.tanh(cos_align * 5.0)
+                u_rms = u.square().mean().sqrt().clamp(min=1e-6)
+                vort_rms = vorticity.square().mean().sqrt().clamp(min=1e-6)
+                vort_norm = vorticity * (u_rms / vort_rms)
+                u = u + beltrami_mix * helicity_sign * vort_norm
+
+            delta_theta = -2.0 * r_c * torch.atan((lr * u) / (2.0 * r_c))
+            p.add_(delta_theta)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+_SCHWINGER_ANOMALOUS_MOMENT: float = 1.0 / (137.035999084 * 2.0 * math.pi)
+
+
+@torch.no_grad()
+def _compute_poinsot_inertia_sq(
+    angle_param: torch.Tensor,
+    conic_blend: float = 0.15,
+    paired_raw_scale: torch.Tensor | None = None,
+    is_log_magnitude: bool = False,
+    group_scale_partners: dict | None = None,
+    sin_theta: torch.Tensor | None = None,
+    cos_theta: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute classical Poinsot polar-conic moment of inertia `I_{theta,p}` for each 2D Givens pair `p`.
+
+    Blends the phase-invariant isotropic polar radius squared `r_p^2 = 0.5 * (a_p^2 + b_p^2)` with the
+    instantaneous directional conic tangent metric `g_{conic,p} = a_p^2 sin^2(theta_p) + b_p^2 cos^2(theta_p)`
+    in a single pass over the paired radial scale tensor (including 3-way QKV scale tensors).
+    """
+    if paired_raw_scale is None:
+        paired_raw_scale, is_log_magnitude = _resolve_scale_partner(angle_param, group_scale_partners)
+    if paired_raw_scale is None:
+        return torch.ones_like(angle_param)
+
+    work_dtype = torch.float64 if paired_raw_scale.dtype == torch.float64 else torch.float32
+    if paired_raw_scale.numel() == 2 * angle_param.numel():
+        s_raw = paired_raw_scale.detach()
+        if s_raw.dtype != work_dtype:
+            s_raw = s_raw.to(dtype=work_dtype)
+        s_act = F.softplus(s_raw)
+        s_pairs = s_act.reshape(*angle_param.shape, 2)
+        a_sq = s_pairs[..., 0].square()
+        b_sq = s_pairs[..., 1].square()
+    elif (
+        paired_raw_scale.dim() == angle_param.dim() + 1
+        and paired_raw_scale.shape[1:-1] == angle_param.shape[:-1]
+        and paired_raw_scale.shape[-1] == 2 * angle_param.shape[-1]
+    ):
+        s_raw = paired_raw_scale.detach()
+        if s_raw.dtype != work_dtype:
+            s_raw = s_raw.to(dtype=work_dtype)
+        s_act = F.softplus(s_raw)
+        s_pairs = s_act.reshape(paired_raw_scale.shape[0], *angle_param.shape, 2)
+        a_sq = s_pairs[..., 0].square().mean(dim=0)
+        b_sq = s_pairs[..., 1].square().mean(dim=0)
+    else:
+        return _compute_polar_pair_radius_sq(
+            angle_param,
+            paired_raw_scale=paired_raw_scale,
+            is_log_magnitude=is_log_magnitude,
+            group_scale_partners=group_scale_partners,
+        )
+
+    r_sq = 0.5 * (a_sq + b_sq)
+    if conic_blend <= 0.0:
+        return r_sq if r_sq.dtype == angle_param.dtype else r_sq.to(dtype=angle_param.dtype)
+    if sin_theta is not None and cos_theta is not None:
+        s_t = sin_theta if sin_theta.dtype == work_dtype else sin_theta.to(dtype=work_dtype)
+        c_t = cos_theta if cos_theta.dtype == work_dtype else cos_theta.to(dtype=work_dtype)
+        sin_sq = s_t.square()
+        cos_sq = c_t.square()
+    else:
+        theta_f = angle_param.detach()
+        if theta_f.dtype != work_dtype:
+            theta_f = theta_f.to(dtype=work_dtype)
+        sin_sq = torch.sin(theta_f).square()
+        cos_sq = 1.0 - sin_sq
+    g_conic_sq = a_sq * sin_sq + b_sq * cos_sq
+    inertia_sq = (1.0 - conic_blend) * r_sq + conic_blend * g_conic_sq
+    return inertia_sq if inertia_sq.dtype == angle_param.dtype else inertia_sq.to(dtype=angle_param.dtype)
+
+
+class GyricAdam(HessianPairAdam):
+    """Classical Gyroscopic Lande-Projection & Thomas-Precession Optimizer (`GyricAdam`) for GRT.
+
+    Models each multi-stage rotational cascade `[K, P]` (or `[K, H, P]`) as a coupled classical
+    Poinsot gyroscope system with three geometric mechanisms:
+      1. **Poinsot Polar-Conic Inertia Preconditioning**: Weights each rotation plane by its inverse
+         polar-conic moment of inertia `I_{theta,p}^(-polar_exponent)` (`(1 - conic_blend) * r_p^2 + conic_blend * g_{conic,p}`)
+         normalized to unit stage mean, preventing high-energy planes from over-rotating on unseen test inputs.
+      2. **Classical Lande Vector-Projection Difference (`(L^2 - S^2) / J^2`)**: Decomposes the
+         preconditioned cascade angular velocity `J = u` in the local planar tangent frame
+         `(cos(theta), sin(theta))` into a coherent collective ("orbital") cascade velocity `L`
+         and a stage-differentiating ("intrinsic gyric") twist `S = u - L`. The difference between
+         the orbital Lande projection `(J^2 + L^2 - S^2) / (2 * J^2)` and spin Lande projection
+         `(J^2 + S^2 - L^2) / (2 * J^2)` is the exact cascade coherence cosine
+         `c_lande = (L^2 - S^2) / J^2 in [-1, +1]`.
+      3. **Schwinger-Lande Coherent Boost & Retrograde Thomas Precession Damping**:
+         - When a plane rotates coherently across stages (`c_lande > 0`, `L^2 > S^2`), the stage-differentiating
+           velocity `S` receives the classical gyric boost `1 + gyric_excess * c_lande` (incorporating
+           the Schwinger anharmonic correction `a_e = alpha / (2 * pi) ≈ 0.0011614`).
+         - When stages twist incoherently against each other (`c_lande < 0`, `S^2 > L^2`), retrograde
+           **Thomas curvilinear precession** damps the excess stage fighting via `1 + thomas_weight * c_lande < 1`,
+           preserving rigid-body Poinsot generalization on unseen test distributions.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        polar_exponent: float = 0.5,
+        conic_blend: float = 0.15,
+        polar_min_radius_sq: float = 0.25,
+        polar_max_radius_sq: float = 4.0,
+        anomalous_moment: float = _SCHWINGER_ANOMALOUS_MOMENT,
+        gyric_excess: float | None = None,
+        thomas_weight: float = 0.15,
+        max_cascade_stages: int = 256,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        eff_gyric_excess = (0.05 + anomalous_moment) if gyric_excess is None else gyric_excess
+        self.defaults["polar_exponent"] = polar_exponent
+        self.defaults["conic_blend"] = conic_blend
+        self.defaults["polar_min_radius_sq"] = polar_min_radius_sq
+        self.defaults["polar_max_radius_sq"] = polar_max_radius_sq
+        self.defaults["anomalous_moment"] = anomalous_moment
+        self.defaults["gyric_excess"] = eff_gyric_excess
+        self.defaults["thomas_weight"] = thomas_weight
+        self.defaults["max_cascade_stages"] = max_cascade_stages
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        polar_exp = self.defaults.get("polar_exponent", 0.5)
+        conic_blend = self.defaults.get("conic_blend", 0.15)
+        r_min_sq = self.defaults.get("polar_min_radius_sq", 0.25)
+        r_max_sq = self.defaults.get("polar_max_radius_sq", 4.0)
+        gyric_excess = self.defaults.get("gyric_excess", 0.05 + _SCHWINGER_ANOMALOUS_MOMENT)
+        thomas_weight = self.defaults.get("thomas_weight", 0.15)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+        limit = (max_ang / lr) if (max_ang is not None and lr > 0.0) else None
+        if sophia_rho is not None and sophia_rho > 0.0:
+            limit = min(limit, sophia_rho) if limit is not None else sophia_rho
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            sin_theta = torch.sin(p.data)
+            cos_theta = torch.cos(p.data)
+            inertia_sq = _compute_poinsot_inertia_sq(
+                p, conic_blend=conic_blend, sin_theta=sin_theta, cos_theta=cos_theta
+            ).clamp(min=r_min_sq, max=r_max_sq)
+            inv_metric = torch.rsqrt(inertia_sq) if polar_exp == 0.5 else inertia_sq.pow(-polar_exp)
+            inv_metric = inv_metric / inv_metric.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            pos_curv = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            u = (m_eff * inv_metric) / pos_curv
+
+            if (
+                (gyric_excess != 0.0 or thomas_weight != 0.0)
+                and p.dim() in (2, 3)
+                and 1 < p.shape[0] <= max_cascade_stages
+            ):
+                # Covariant collective ("orbital") velocity L and stage-differentiating ("gyric") twist S
+                L_x = (cos_theta * u).mean(dim=0, keepdim=True)
+                L_y = (sin_theta * u).mean(dim=0, keepdim=True)
+                L = cos_theta * L_x + sin_theta * L_y
+                S = u - L
+                J_sq = u.square().mean(dim=0, keepdim=True) + eps
+                L_sq = L_x.square() + L_y.square() + 0.5 * eps
+                S_sq = S.square().mean(dim=0, keepdim=True) + 0.5 * eps
+                # Exact Lande vector-projection difference c_lande = (L^2 - S^2) / J^2 in [-1, 1]
+                c_lande = ((L_sq - S_sq) / J_sq).clamp(min=-1.0, max=1.0)
+                g_spin = torch.where(
+                    c_lande >= 0.0,
+                    1.0 + gyric_excess * c_lande,
+                    1.0 + thomas_weight * c_lande,
+                )
+                u_gyric = L + g_spin * S
+            else:
+                u_gyric = u
+
+            if limit is not None:
+                u_gyric.clamp_(-limit, limit)
+
+            p.add_(u_gyric, alpha=-lr)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+class RindlerAdam(HessianPairAdam):
+    """Classical Rindler Hyperbolic Wedge & Acceleration-Induced Horizon Optimizer (`RindlerAdam`) for GRT.
+
+    Extends `SymplecticAdam` (`T*T^P` non-squeezing + Casimir wave-cavity coupling) with classical
+    Rindler hyperbolic wedge geometry (`ds^2 = -xi^2 d_eta^2 + d_xi^2`) for uniformly accelerated frames:
+      1. **Proper Angular Acceleration & Rindler Temperature (`T_R = a / (2 * pi)`)**: Measures the
+         dimensionless proper acceleration `a_p = |g_p - m_hat_p| / c_rms` between the instantaneous
+         tangential gradient `g_p` and bias-corrected momentum `m_hat_p`. Inertial trajectories (`g_p ~ m_hat_p`,
+         `a_p -> 0`) experience zero Rindler temperature (`T_R -> 0`) and glide unhindered along smooth valleys,
+         whereas accelerating or oscillating trajectories (`a_p > 0`) induce thermal Rindler stiffness
+         `c_rindler = sqrt(c_base^2 + c_rms^2 * (zpe_floor^2 / (u_norm^2 + zpe_floor) + rindler_weight * T_R^2))`.
+      2. **Helmholtz-Casimir Cavity Boundary Coupling**: Applies trace-free deviatoric projection and discrete
+         Neumann wave-cavity Laplacian smoothing across cascade stages `[K, P]`.
+      3. **Dynamic Rindler Apparent Horizon Retraction**: Contracts the asymptotic Cayley horizon radius
+         reciprocally with the mean layer acceleration temperature
+         `r_horizon = clamp(r_c / (1 + horizon_contraction * mean(T_R)), 0.25 * r_c, r_c)` before applying
+         `-2 * r_horizon * arctan((lr * u_total) / (2 * r_horizon))`.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_angular_step: float | None = 0.05,
+        nesterov: bool = True,
+        hessian_mode: bool = True,
+        gamma_gn: float = 1.0,
+        curv_weight: float = 0.05,
+        zpe_floor: float = 0.02,
+        rindler_weight: float = 0.25,
+        horizon_contraction: float = 0.20,
+        deviatoric_mix: float = 0.15,
+        casimir_mix: float = 0.10,
+        cyclide_min_metric_sq: float = 0.25,
+        cyclide_max_metric_sq: float = 4.0,
+        cayley_radius: float = 0.05,
+        max_cascade_stages: int = 256,
+        coupling_lr_mult: float = 1.0,
+        scale_partners: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_angular_step=max_angular_step,
+            nesterov=nesterov,
+            hessian_mode=hessian_mode,
+            gamma_gn=gamma_gn,
+            curv_weight=curv_weight,
+            scale_partners=scale_partners,
+            **kwargs,
+        )
+        self.defaults["zpe_floor"] = zpe_floor
+        self.defaults["rindler_weight"] = rindler_weight
+        self.defaults["horizon_contraction"] = horizon_contraction
+        self.defaults["deviatoric_mix"] = deviatoric_mix
+        self.defaults["casimir_mix"] = casimir_mix
+        self.defaults["cyclide_min_metric_sq"] = cyclide_min_metric_sq
+        self.defaults["cyclide_max_metric_sq"] = cyclide_max_metric_sq
+        self.defaults["cayley_radius"] = cayley_radius
+        self.defaults["max_cascade_stages"] = max_cascade_stages
+        self.defaults["coupling_lr_mult"] = coupling_lr_mult
+
+    def _foreach_hessian_angle_step(
+        self,
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        hess_emas,
+        curv_emas,
+        c_thetas,
+        step,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        max_ang,
+        nesterov=False,
+        gamma_gn=1.0,
+        curv_weight=0.25,
+        tau_saddle=1e-4,
+        eps_kick=1e-12,
+        antipodal_kick=0.2,
+        eps_h=1e-6,
+        sophia_rho=5.0,
+    ):
+        bc1 = 1.0 - beta1**step
+        bc2 = 1.0 - beta2**step
+        bc1_next = 1.0 - beta1 ** (step + 1)
+
+        if wd != 0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        torch._foreach_mul_(curv_emas, beta2)
+        torch._foreach_add_(curv_emas, c_thetas, alpha=1.0 - beta2)
+
+        torch._foreach_mul_(hess_emas, beta2)
+        torch._foreach_add_(hess_emas, c_thetas, alpha=1.0 - beta2)
+        if gamma_gn != 0.0:
+            torch._foreach_addcmul_(hess_emas, grads, grads, value=(1.0 - beta2) * gamma_gn)
+
+        zpe_floor = self.defaults.get("zpe_floor", 0.02)
+        rindler_weight = self.defaults.get("rindler_weight", 0.25)
+        horizon_contraction = self.defaults.get("horizon_contraction", 0.20)
+        dev_mix = self.defaults.get("deviatoric_mix", 0.15)
+        casimir_mix = self.defaults.get("casimir_mix", 0.10)
+        g_min_sq = self.defaults.get("cyclide_min_metric_sq", 0.25)
+        g_max_sq = self.defaults.get("cyclide_max_metric_sq", 4.0)
+        max_cascade_stages = self.defaults.get("max_cascade_stages", 256)
+        r_c = max_ang if (max_ang is not None and max_ang > 0.0) else self.defaults.get("cayley_radius", 0.05)
+
+        for p, g, m, v, h in zip(params, grads, exp_avgs, exp_avg_sqs, hess_emas):
+            if nesterov:
+                m_hat = m * (beta1 / bc1_next) + g * ((1.0 - beta1) / bc1)
+            else:
+                m_hat = m / bc1
+            v_hat = v / bc2
+            h_hat = h / bc2
+
+            sin_theta = torch.sin(p.data)
+            cos_theta = torch.cos(p.data)
+            r_conic_sq = _compute_cyclide_conic_metric_sq(
+                p, sin_theta=sin_theta, cos_theta=cos_theta
+            ).clamp(min=g_min_sq, max=g_max_sq)
+            r_conic_sq = r_conic_sq / r_conic_sq.mean().clamp(min=1e-6)
+
+            at_saddle = (h_hat < -tau_saddle) & (m_hat.abs() <= h_hat.abs())
+            c_raw = (v_hat.sqrt() + curv_weight * h_hat.clamp(min=0.0) + eps).clamp(min=eps_h)
+            c_base = c_raw * r_conic_sq.sqrt()
+
+            c_rms_sq = c_base.square().mean().clamp(min=eps_h * eps_h)
+            c_rms = c_rms_sq.sqrt()
+            u_norm_sq = m_hat.square() / c_rms_sq
+
+            accel = (g - m_hat).abs() / c_rms
+            t_rindler = accel / (2.0 * math.pi)
+
+            stiff_rel = torch.zeros_like(c_base)
+            if zpe_floor > 0.0:
+                stiff_rel = stiff_rel + (zpe_floor * zpe_floor) / (u_norm_sq + zpe_floor)
+            if rindler_weight > 0.0:
+                stiff_rel = stiff_rel + rindler_weight * t_rindler.square()
+
+            c_rindler = torch.sqrt(c_base.square() + c_rms_sq * stiff_rel)
+
+            kick_sign = torch.where(
+                m_hat.abs() > eps_kick,
+                torch.sign(m_hat),
+                torch.where(m_hat + eps_kick >= 0.0, torch.ones_like(m_hat), -torch.ones_like(m_hat)),
+            )
+            m_eff = torch.where(
+                at_saddle,
+                m_hat + kick_sign * (antipodal_kick * h_hat.abs()),
+                m_hat,
+            )
+            u = m_eff / c_rindler
+
+            if p.dim() >= 2 and 1 < p.shape[0] <= max_cascade_stages:
+                u_total = _apply_casimir_cavity_cascade(
+                    u, deviatoric_mix=dev_mix, casimir_mix=casimir_mix
+                )
+            else:
+                u_total = u
+
+            if horizon_contraction > 0.0:
+                t_mean = float(t_rindler.mean())
+                r_horizon = max(0.25 * r_c, min(r_c, r_c / (1.0 + horizon_contraction * t_mean)))
+            else:
+                r_horizon = r_c
+
+            delta_theta = -2.0 * r_horizon * torch.atan((lr * u_total) / (2.0 * r_horizon))
+            p.add_(delta_theta)
+            p.data.copy_((p.data + math.pi) % (2.0 * math.pi) - math.pi)
+
+
 class ToroidalLion(Optimizer):
     """Sign-Momentum Toroidal Optimizer (`ToroidalLion` / `SignMomentumTorus`) for GRT.
 
@@ -1734,7 +3125,7 @@ def build_grt_optimizer(
     optimizer_type: str | None = None,
     angle_lr_mult: float = 1.0,
     scale_lr_mult: float = 1.0,
-    coupling_lr_mult: float = 3.0,
+    coupling_lr_mult: float | None = None,
     coupling_weight_decay: float | None = None,
     embedding_lr_mult: float = 1.0,
     log_magnitude_lr_mult: float = 1.0,
@@ -1753,14 +3144,20 @@ def build_grt_optimizer(
     sophia_rho: float = 5.0,
     **kwargs,
 ) -> Optimizer:
-    """Construct a GRT geometric optimizer (`HessianPairAdam`, `PairAdam`, `ToroidalMuon`, `PolarNaturalAdam`, `RotorAdam`, `CyclideAdam`, or `ToroidalLion`)."""
+    """Construct a GRT geometric optimizer (`HessianPairAdam`, `PairAdam`, `ToroidalMuon`, `PolarNaturalAdam`, `RotorAdam`, `CyclideAdam`, `SymplecticAdam`, or `ToroidalLion`)."""
+    opt_key = (optimizer_type or ("hessian_pair_adam" if hessian_mode else "pair_adam")).lower()
+    eff_coupling_lr_mult = (
+        (1.0 if opt_key in ("symplectic_adam", "rindler_adam") else 3.0)
+        if coupling_lr_mult is None
+        else coupling_lr_mult
+    )
     param_groups = build_grt_param_groups(
         model,
         lr=lr,
         weight_decay=weight_decay,
         angle_lr_mult=angle_lr_mult,
         scale_lr_mult=scale_lr_mult,
-        coupling_lr_mult=coupling_lr_mult,
+        coupling_lr_mult=eff_coupling_lr_mult,
         coupling_weight_decay=coupling_weight_decay,
         embedding_lr_mult=embedding_lr_mult,
         log_magnitude_lr_mult=log_magnitude_lr_mult,
@@ -1772,7 +3169,6 @@ def build_grt_optimizer(
         nesterov=nesterov,
         hessian_mode=hessian_mode,
     )
-    opt_key = (optimizer_type or ("hessian_pair_adam" if hessian_mode else "pair_adam")).lower()
     if opt_key == "toroidal_lion":
         return ToroidalLion(
             param_groups,
@@ -1792,6 +3188,13 @@ def build_grt_optimizer(
         "polar_natural_adam": PolarNaturalAdam,
         "rotor_adam": RotorAdam,
         "cyclide_adam": CyclideAdam,
+        "symplectic_adam": SymplecticAdam,
+        "gyric_adam": GyricAdam,
+        "hannay_adam": HannayAdam,
+        "poncelet_adam": PonceletAdam,
+        "huygens_adam": HuygensAdam,
+        "beltrami_adam": BeltramiAdam,
+        "rindler_adam": RindlerAdam,
     }
     if opt_key not in opt_map:
         raise ValueError(f"Unknown GRT optimizer_type={optimizer_type!r}. Expected one of { sorted([*opt_map, 'toroidal_lion']) }.")
@@ -1816,16 +3219,27 @@ def build_grt_optimizer(
     )
 
 
+create_grt_optimizer = build_grt_optimizer
+
+
 __all__ = [
+    "BeltramiAdam",
     "CyclideAdam",
+    "GyricAdam",
+    "HannayAdam",
     "HessianPairAdam",
+    "HuygensAdam",
     "PairAdam",
     "PolarNaturalAdam",
+    "PonceletAdam",
+    "RindlerAdam",
     "RotorAdam",
+    "SymplecticAdam",
     "ToroidalLion",
     "ToroidalMuon",
     "build_grt_optimizer",
     "build_grt_param_groups",
     "compute_intrinsic_angle_hessian",
+    "create_grt_optimizer",
     "pair_model_angles_and_scales",
 ]
